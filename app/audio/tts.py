@@ -4,9 +4,9 @@ import traceback
 import numpy as np
 import soundfile as sf
 import audioop
+import scipy.signal
 from pydub import AudioSegment
 from app.config import KOKORO_VOICE, KOKORO_LANG
-import scipy
 
 # This will be initialized in main.py and passed
 tts_model = None
@@ -16,7 +16,6 @@ def set_tts_model(model):
     global tts_model
     tts_model = model
 
-# def _get_audio_array_from_tts_result(result) -> (np.ndarray, int):
 def _get_audio_array_from_tts_result(result):
     """Internal helper to extract audio array from Kokoro's varied outputs."""
     sample_rate = 24000  # Default Kokoro sample rate
@@ -34,6 +33,7 @@ def _get_audio_array_from_tts_result(result):
                 continue
             
             # Handle KPipeline.Result object
+            audio_data = None
             if hasattr(chunk_obj, 'output') and hasattr(chunk_obj.output, 'audio'):
                 audio_data = chunk_obj.output.audio
             # Handle raw generator output
@@ -129,12 +129,11 @@ def synthesize_speech(text: str, output_format: str = "wav", voice: str = None) 
             buffer.seek(0)
             return buffer.read()
 
-def synthesize_speech_streaming(text: str, voice: str = None) -> bytes:
+def synthesize_speech_for_pipeline(text: str, output_format: str = "wav", voice: str = None) -> bytes:
     """
-    Synchronous TTS synthesis optimized for the streaming pipeline.
+    Synchronous TTS synthesis wrapper for the streaming pipeline.
     This is what the tts_consumer calls.
-    Returns audio as WAV bytes.
+    Returns audio bytes in the requested format.
     """
-    # This is just a wrapper for the 'wav' format for now.
-    # In Step 2, we will modify this to return mulaw.
-    return synthesize_speech(text, output_format="wav", voice=voice)
+    return synthesize_speech(text, output_format=output_format, voice=voice)
+

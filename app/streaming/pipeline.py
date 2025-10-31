@@ -8,7 +8,7 @@ from app.agent.state import InterviewState, PatientInfoExtraction
 from app.agent.prompts import build_system_prompt
 from app.agent.tools import update_patient_info, end_call, forward_call_to_human
 from app.streaming.buffer import SentenceBuffer
-from app.audio.tts import synthesize_speech_streaming
+from app.audio.tts import synthesize_speech_for_pipeline # Updated import
 
 # This will be initialized in main.py
 agent_manager = None
@@ -106,7 +106,8 @@ async def llm_producer(
 
 async def tts_consumer(
     sentence_queue: asyncio.Queue,
-    audio_queue: asyncio.Queue
+    audio_queue: asyncio.Queue,
+    output_format: str = "wav" # Added output_format
 ):
     """
     Consumer: Takes sentences, synthesizes audio, and puts chunks in audio queue.
@@ -121,14 +122,15 @@ async def tts_consumer(
                 await audio_queue.put(None) # Pass sentinel to audio queue
                 break
                 
-            print(f"[Queue→TTS] Synthesizing: {sentence[:50]}...")
+            print(f"[Queue→TTS] Synthesizing for {output_format}: {sentence[:50]}...")
             
             # Run blocking TTS in thread pool
             loop = asyncio.get_event_loop()
             audio_bytes = await loop.run_in_executor(
                 None, # Default thread pool
-                synthesize_speech_streaming,
-                sentence
+                synthesize_speech_for_pipeline,
+                sentence,
+                output_format # Pass the requested format
             )
             
             await audio_queue.put(audio_bytes)
@@ -147,6 +149,7 @@ async def audio_chunk_streamer(
 ) -> AsyncGenerator[bytes, None]:
     """
     Async generator that yields audio chunks as they become available.
+    (This is for the HTTP endpoint, not the WebSocket)
     """
     first_chunk = True
     try:
@@ -168,3 +171,4 @@ async def audio_chunk_streamer(
     except Exception as e:
         print(f"[Audio Streamer Error] {e}")
         traceback.print_exc()
+

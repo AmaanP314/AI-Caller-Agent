@@ -19,15 +19,19 @@ class MedicareAgent:
         # In-memory buffer for active calls
         self._call_buffers = {}
 
-    def _get_buffer(self, session_id: str):
+    def _get_buffer(self, session_id: str, caller_id: str = None):
         """Get or create an in-memory buffer for a session."""
         if session_id not in self._call_buffers:
             self._call_buffers[session_id] = {
                 "turns": [],
                 "started_at": datetime.utcnow(),
-                "caller_id": None, # Can be set by websocket
+                "caller_id": caller_id, # Can be set by websocket
                 "patient_info": PatientInfoExtraction()
             }
+        elif caller_id and not self._call_buffers[session_id].get("caller_id"):
+            # Update caller_id if it was missing
+            self._call_buffers[session_id]["caller_id"] = caller_id
+            
         return self._call_buffers[session_id]
 
     async def process_message_streaming(
@@ -54,7 +58,7 @@ class MedicareAgent:
         current_messages = current_state.values.get("messages", [])
         current_patient_info = current_state.values.get("patient_info", PatientInfoExtraction())
         
-        # Update buffer with latest info
+        # Update buffer with latest info from checkpointer
         buffer["patient_info"] = current_patient_info
 
         # Manually construct the state for the streaming node
@@ -64,6 +68,7 @@ class MedicareAgent:
         }
 
         full_agent_response = ""
+        final_message_obj = None
         
         # Stream from agent node
         async for chunk in agent_node_streaming(full_state):
@@ -73,7 +78,7 @@ class MedicareAgent:
 
             elif chunk.get("type") == "final":
                 # Now properly update the graph state
-                final_message = chunk["messages"][0]  # The AIMessage
+                final_message_obj = chunk["messages"][0]  # The AIMessage
                 
                 # Add agent response to buffer
                 if full_agent_response.strip():
@@ -81,47 +86,38 @@ class MedicareAgent:
 
                 # Update LangGraph state
                 update_data = {
-                    "messages": input_data["messages"] + [final_message]
+                    "messages": input_data["messages"] + [final_message_obj]
                 }
                 self.app.update_state(config, update_data)
                 
-                # Handle tool calls if any
-                if isinstance(final_message, AIMessage) and final_message.tool_calls:
-                    tool_state = self.app.get_state(config)
-                    tool_result = tool_node(tool_state.values)
-                    
-                    # Update buffer with new patient info from tool
-                    if "patient_info" in tool_result:
-                        buffer["patient_info"] = tool_result["patient_info"]
+        # Handle tool calls AFTER streaming, if any
+        if final_message_obj and isinstance(final_message_obj, AIMessage) and final_message_obj.tool_calls:
+            tool_state = self.app.get_state(config)
+            tool_result = tool_node(tool_state.values)
+            
+            # Update buffer with new patient info from tool
+            if "patient_info" in tool_result:
+                buffer["patient_info"] = tool_result["patient_info"]
 
-                    # Update LangGraph state
-                    self.app.update_state(config, tool_result)
-                    updated_state = self.app.get_state(config)
-                    
-                    # Check if we need to continue to agent
-                    next_step = self.app.config["edges"]["tool_node"].get(
-                        updated_state.values
-                    )
-                    
-                    # This logic needs simplification, but let's follow original
-                    # A bit of a hack: checking the *compiled* graph logic
-                    # A better way is to re-run `after_tool`
-                    # For now, let's assume `update_patient_info` always continues
-                    tool_name = final_message.tool_calls[0]["name"]
-                    
-                    if tool_name == "update_patient_info":
-                        follow_up_state = self.app.get_state(config)
-                        follow_up_result = agent_node(follow_up_state.values)
-                        
-                        self.app.update_state(config, follow_up_result)
-                        
-                        follow_up_message = follow_up_result["messages"][0]
-                        if isinstance(follow_up_message, AIMessage) and follow_up_message.content:
-                            buffer["turns"].append({"role": "agent", "content": follow_up_message.content, "timestamp": datetime.utcnow()})
-                            yield {"sentence": follow_up_message.content}
+            # Update LangGraph state
+            self.app.update_state(config, tool_result)
+            
+            # Check if we need to continue to agent
+            tool_name = final_message_obj.tool_calls[0]["name"]
+            
+            if tool_name == "update_patient_info":
+                follow_up_state = self.app.get_state(config)
+                follow_up_result = agent_node(follow_up_state.values)
+                
+                self.app.update_state(config, follow_up_result)
+                
+                follow_up_message = follow_up_result["messages"][0]
+                if isinstance(follow_up_message, AIMessage) and follow_up_message.content:
+                    buffer["turns"].append({"role": "agent", "content": follow_up_message.content, "timestamp": datetime.utcnow()})
+                    yield {"sentence": follow_up_message.content}
 
-                yield {"final": True}
-                return
+        yield {"final": True}
+        return
 
     def end_call(self, session_id: str, reason: str = "completed"):
         """Flush buffer to DB and clear from memory."""
@@ -129,9 +125,12 @@ class MedicareAgent:
             buffer = self._call_buffers[session_id]
             
             # Get latest patient info from checkpointer just in case
-            final_state = self.get_patient_info(session_id)
-            if final_state:
-                 buffer["patient_info"] = final_state
+            try:
+                final_state = self.get_patient_info(session_id)
+                if final_state:
+                    buffer["patient_info"] = final_state
+            except Exception as e:
+                print(f"Warning: Could not get final state from checkpointer: {e}")
 
             end_call_and_save(session_id, buffer, reason)
             del self._call_buffers[session_id]
@@ -147,3 +146,4 @@ class MedicareAgent:
             return state_snapshot.values["patient_info"].model_dump()
             
         return {}
+
