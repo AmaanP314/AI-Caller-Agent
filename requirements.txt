@@ -1,0 +1,31 @@
+# FastAPI & Server
+fastapi==0.115.0
+uvicorn[standard]==0.31.0
+websockets==13.1
+python-multipart==0.0.12
+
+# ML/AI (match your PyTorch version)
+torch==2.5.0
+transformers==4.46.0
+accelerate==1.1.0
+
+# Audio Processing
+soundfile==0.12.1
+pydub==0.25.1
+scipy==1.14.1
+numpy==1.26.4
+
+# TTS
+kokoro
+
+# LangChain
+langchain-core
+langchain-google-genai
+langgraph
+
+# Database
+sqlalchemy==2.0.35
+
+# Utilities
+pydantic==2.9.2
+typing-extensions==4.12.2
