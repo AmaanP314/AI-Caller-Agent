@@ -8,7 +8,7 @@ from app.agent.state import InterviewState, PatientInfoExtraction
 from app.agent.prompts import build_system_prompt
 from app.agent.tools import update_patient_info, end_call, forward_call_to_human
 from app.streaming.buffer import SentenceBuffer
-from app.audio.tts import synthesize_speech_for_pipeline # Updated import
+from app.audio.tts import synthesize_speech_for_pipeline
 
 # This will be initialized in main.py
 agent_manager = None
@@ -53,6 +53,9 @@ async def agent_node_streaming(state: InterviewState) -> AsyncGenerator[dict, No
             if hasattr(chunk, 'tool_calls') and chunk.tool_calls:
                 tool_calls.extend(chunk.tool_calls)
     
+    except asyncio.CancelledError:
+        print("[agent_node_streaming] Stream cancelled.")
+        raise # Re-raise to be handled by producer
     except Exception as e:
         print(f"Error during LLM stream: {e}")
         traceback.print_exc()
@@ -76,7 +79,8 @@ async def agent_node_streaming(state: InterviewState) -> AsyncGenerator[dict, No
 async def llm_producer(
     session_id: str,
     user_message: str,
-    sentence_queue: asyncio.Queue
+    sentence_queue: asyncio.Queue,
+    interruption_event: asyncio.Event
 ):
     """
     Producer: Streams sentences from LLM and puts them in the queue.
@@ -88,39 +92,52 @@ async def llm_producer(
 
     try:
         async for chunk in agent_manager.process_message_streaming(session_id, user_message):
+            if interruption_event.is_set():
+                print("[LLM Producer] Interruption detected, stopping.")
+                break # Exit loop if interrupted
+                
             if "sentence" in chunk:
                 sentence = chunk["sentence"]
                 print(f"[LLM→Queue] Sentence: {sentence[:50]}...")
                 await sentence_queue.put(sentence)
             
             elif chunk.get("final"):
-                print("[LLM→Queue] Streaming complete, sending sentinel")
-                await sentence_queue.put(None)
+                # Don't send sentinel yet, wait for finally
                 break
                 
+    except asyncio.CancelledError:
+        print("[LLM Producer] Cancelled.")
     except Exception as e:
         print(f"[LLM Producer Error] {e}")
         traceback.print_exc()
-        await sentence_queue.put(None) # Send sentinel on error
+    finally:
+        # CRITICAL: Always send sentinel to shut down tts_consumer
+        print("[LLM Producer] Sending sentinel to TTS.")
+        await sentence_queue.put(None)
 
 
 async def tts_consumer(
     sentence_queue: asyncio.Queue,
     audio_queue: asyncio.Queue,
-    output_format: str = "wav" # Added output_format
+    interruption_event: asyncio.Event,
+    output_format: str = "wav"
 ):
     """
     Consumer: Takes sentences, synthesizes audio, and puts chunks in audio queue.
     """
     try:
         while True:
+            if interruption_event.is_set():
+                print("[TTS Consumer] Interruption detected, stopping.")
+                break
+                
+            # Wait for a sentence
             sentence = await sentence_queue.get()
             
             if sentence is None:
                 print("[Queue→TTS] Received sentinel, ending synthesis")
                 sentence_queue.task_done()
-                await audio_queue.put(None) # Pass sentinel to audio queue
-                break
+                break # Exit loop
                 
             print(f"[Queue→TTS] Synthesizing for {output_format}: {sentence[:50]}...")
             
@@ -130,18 +147,33 @@ async def tts_consumer(
                 None, # Default thread pool
                 synthesize_speech_for_pipeline,
                 sentence,
-                output_format # Pass the requested format
+                output_format
             )
+            
+            # Before putting in queue, check one last time
+            if interruption_event.is_set():
+                print("[TTS Consumer] Interrupted before sending audio chunk.")
+                sentence_queue.task_done()
+                break
             
             await audio_queue.put(audio_bytes)
             print(f"[TTS→Audio Queue] Chunk ready ({len(audio_bytes)} bytes)")
             
             sentence_queue.task_done()
             
+    except asyncio.CancelledError:
+        print("[TTS Consumer] Cancelled.")
     except Exception as e:
         print(f"[TTS Consumer Error] {e}")
         traceback.print_exc()
-        await audio_queue.put(None)
+    # ---
+    # !! REMOVED FLAWED FINALLY BLOCK !!
+    # The agent_handler_task is responsible for clearing the audio_queue.
+    # This task should NOT send a sentinel to the audio_queue,
+    # as the audio_sender_task is permanent.
+    # ---
+    finally:
+        print("[TTS Consumer] Task finished.")
 
 
 async def audio_chunk_streamer(
@@ -157,7 +189,8 @@ async def audio_chunk_streamer(
             audio_chunk = await audio_queue.get()
             
             if audio_chunk is None:
-                print("[Audio Streamer] Stream complete")
+                # This should no longer be called, but as a safeguard:
+                print("[Audio Streamer] Stream complete (via sentinel)")
                 audio_queue.task_done()
                 break
                 

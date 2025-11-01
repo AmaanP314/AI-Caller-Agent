@@ -11,12 +11,12 @@ from kokoro import KPipeline
 from app.config import WHISPER_MODEL, KOKORO_LANG, GOOGLE_API_KEY
 from app.database import init_db
 from app.api import http, websocket
-from app.audio import stt, tts
+from app.audio import stt, tts, vad  # <-- Import vad
 from app.streaming.manager import MedicareAgent
 from app.streaming.pipeline import set_agent_manager as set_pipeline_agent_manager
 
 # --- Global Variables ---
-app = FastAPI(title="Medicare AI Voice Agent", version="1.1.0-refactored")
+app = FastAPI(title="Medicare AI Voice Agent", version="1.2.0-vad-interrupt")
 agent_manager = MedicareAgent()
 
 # --- Model Loading ---
@@ -55,6 +55,12 @@ def load_models():
         print(f"✗ Failed to load Kokoro TTS: {e}")
         tts.set_tts_model(None) # Set to None so it can fallback
         
+    # 3. Load Silero VAD
+    try:
+        vad.create_vad_model() # This loads and sets the model internally
+    except Exception as e:
+        print(f"✗ Failed to load Silero VAD: {e}")
+        
     print("✓ Models loaded successfully")
 
 # --- FastAPI App Setup ---
@@ -66,7 +72,6 @@ async def startup_event():
         print("ERROR: GOOGLE_API_KEY is not set. The agent will not work.")
         print("Please create a .env file and add your key.")
         print("="*50)
-        # In a real prod env, you might want to raise an Exception
     
     load_models()
     init_db()
@@ -74,7 +79,6 @@ async def startup_event():
     # Inject dependencies
     http.set_agent_manager(agent_manager)
     set_pipeline_agent_manager(agent_manager)
-    # websocket router will get it via Depends()
 
 # Add CORS middleware
 app.add_middleware(
@@ -88,20 +92,3 @@ app.add_middleware(
 # Include API routers
 app.include_router(http.router)
 app.include_router(websocket.router)
-
-# --- Server Startup ---
-# if __name__ == "__main__":
-#     port = int(os.getenv("PORT", 8000))
-#     print(f"\n🚀 Starting Medicare AI Voice Agent on port {port}")
-#     print(f"📡 Health check: http://localhost:{port}/")
-#     print(f"🔗 Test Endpoint: http://localhost:{port}/docs")
-#     print(f"🔗 VICIdial WebSocket: ws://localhost:{port}/ws/vicidial/{{session_id}}\n")
-    
-#     uvicorn.run(
-#         "main:app",
-#         host="0.0.0.0",
-#         port=port,
-#         workers=1,
-#         log_level="info",
-#         reload=True # Enable reload for development
-#     )

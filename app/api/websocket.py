@@ -6,31 +6,40 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends
 from app.streaming.manager import MedicareAgent
 from app.api.http import get_agent_manager # Reuse the dependency
 from app.audio.stt import transcribe_audio
-from app.audio.utils import mulaw_to_pcm16k_bytes
+from app.audio import vad
+from app.audio.utils import convert_mulaw_chunk_to_pcm16k
 from app.streaming.pipeline import llm_producer, tts_consumer
+from app.config import VAD_SILENCE_TIMEOUT_MS
 
 router = APIRouter()
 
-# Define constants for audio
-MULAW_CHUNK_SIZE = 4000 # 0.5 seconds of 8kHz mulaw audio (8000 bytes/s)
+# --- Helper to clear queues on interruption ---
+async def clear_async_queue(q: asyncio.Queue):
+    """Remove all items from an asyncio Queue."""
+    while not q.empty():
+        try:
+            q.get_nowait()
+            q.task_done()
+        except asyncio.QueueEmpty:
+            break
 
+# --- Task 1: The "Mouth" (Audio Sender) ---
 async def audio_sender_task(
     websocket: WebSocket,
     audio_queue: asyncio.Queue,
     session_id: str
 ):
     """
-    A single, long-running task that pulls audio from the queue
-    and sends it over the WebSocket.
+    Pulls audio from the audio_queue and sends it over the WebSocket.
+    This runs continuously for the entire call.
     """
     try:
         while True:
             audio_chunk = await audio_queue.get()
-            if audio_chunk is None:
-                print(f"[{session_id}] Audio sender received sentinel, closing.")
-                break
             
-            # Convert audio chunk (which is mulaw bytes) to base64
+            # This task is permanent. It only dies when the WebSocket
+            # disconnects. We no longer check for a None sentinel.
+            
             chunk_b64 = base64.b64encode(audio_chunk).decode('utf-8')
             
             await websocket.send_json({
@@ -41,11 +50,216 @@ async def audio_sender_task(
             
     except WebSocketDisconnect:
         print(f"[{session_id}] Audio sender disconnected.")
+    except asyncio.CancelledError:
+        print(f"[{session_id}] Audio sender cancelled.")
     except Exception as e:
         print(f"[{session_id}] Audio sender error: {e}")
         traceback.print_exc()
+    finally:
+        print(f"[{session_id}] Audio sender task exiting.")
 
 
+# --- Task 2: The "Brain" (Agent Handler) ---
+async def agent_handler_task(
+    session_id: str,
+    transcript_queue: asyncio.Queue,
+    audio_queue: asyncio.Queue,
+    agent_is_speaking_event: asyncio.Event,
+    interruption_event: asyncio.Event
+):
+    """
+    Waits for transcripts, runs the LLM/TTS pipeline, and speaks.
+    Can be interrupted.
+    """
+    try:
+        while True:
+            # 1. Wait for a transcript from the "Ears"
+            transcript = await transcript_queue.get()
+            if transcript is None:
+                break # Shutdown signal
+
+            # 2. Set flags: "I'm about to talk"
+            interruption_event.clear()
+            agent_is_speaking_event.set()
+            
+            # 3. Create pipeline components for this turn
+            sentence_queue = asyncio.Queue()
+            
+            producer_task = asyncio.create_task(
+                llm_producer(session_id, transcript, sentence_queue, interruption_event)
+            )
+            consumer_task = asyncio.create_task(
+                tts_consumer(sentence_queue, audio_queue, interruption_event, output_format="mulaw")
+            )
+
+            # 4. Wait for LLM to finish OR for an interruption
+            interruption_wait_task = asyncio.create_task(
+                interruption_event.wait()
+            )
+            
+            done, pending = await asyncio.wait(
+                [producer_task, interruption_wait_task], # Pass both TASKS
+                return_when=asyncio.FIRST_COMPLETED
+            )
+            
+            # 5. Handle the result
+            if interruption_wait_task in done:
+                # Interruption happened!
+                print(f"[{session_id}] Agent handler: Interruption detected!")
+                
+                # Cancel producer and consumer
+                producer_task.cancel()
+                consumer_task.cancel()
+                
+                # Clear queues to discard pending items
+                await clear_async_queue(sentence_queue)
+                await clear_async_queue(audio_queue)
+            
+            else:
+                # LLM finished normally.
+                print(f"[{session_id}] Agent handler: LLM finished, waiting for TTS.")
+                
+                # We must cancel the interruption_wait_task,
+                interruption_wait_task.cancel()
+                
+                # We must wait for the consumer task to drain the sentence_queue
+                await consumer_task
+
+            # 6. Clear flags: "I'm done talking"
+            agent_is_speaking_event.clear()
+            transcript_queue.task_done()
+            
+    except asyncio.CancelledError:
+        print(f"[{session_id}] Agent handler cancelled.")
+    except Exception as e:
+        print(f"[{session_id}] Agent handler error: {e}")
+        traceback.print_exc()
+    finally:
+        # Ensure flag is cleared on exit
+        agent_is_speaking_event.clear()
+        print(f"[{session_id}] Agent handler task exiting.")
+
+
+# --- Task 3: The "Ears" (Audio Receiver + VAD) ---
+async def audio_receiver_task(
+    websocket: WebSocket,
+    session_id: str,
+    transcript_queue: asyncio.Queue,
+    agent_is_speaking_event: asyncio.Event,
+    interruption_event: asyncio.Event
+):
+    """
+    Receives all audio from the user, runs VAD, and handles
+    endpointing (Step 3) and interruption (Step 4).
+    """
+    vad_model, vad_utils = vad.get_vad_model()
+    if vad_model is None:
+        print(f"[{session_id}] VAD model not loaded. Receiver task cannot start.")
+        return
+
+    # VAD State
+    ratecv_state = None
+    pcm16k_buffer = bytearray()
+    speech_buffer_pcm = bytearray()
+    is_speaking = False
+    silent_chunks = 0
+    
+    # VAD timing constants
+    MS_PER_CHUNK = (vad.VAD_CHUNK_SAMPLES / vad.VAD_SAMPLE_RATE) * 1000 # e.g., 32ms
+    SILENT_CHUNKS_FOR_EOS = int(VAD_SILENCE_TIMEOUT_MS / MS_PER_CHUNK) # e.g., 1000 / 32 = ~31
+    
+    try:
+        while True:
+            # 1. Get audio from client
+            data = await websocket.receive_text()
+            msg = json.loads(data)
+            
+            if msg['type'] == 'hangup':
+                print(f"[{session_id}] 📞 Hangup received in receiver")
+                await transcript_queue.put(None) # Signal handler to shut down
+                break
+            
+            if msg['type'] != 'audio_data':
+                continue
+                
+            # 2. Convert chunk to 16kHz PCM for VAD
+            mulaw_chunk = base64.b64decode(msg['audio'])
+            pcm16k_chunk, ratecv_state = convert_mulaw_chunk_to_pcm16k(mulaw_chunk, ratecv_state)
+            pcm16k_buffer.extend(pcm16k_chunk)
+
+            # 3. Process buffer in VAD-sized chunks
+            while len(pcm16k_buffer) >= vad.VAD_CHUNK_BYTES:
+                current_chunk_pcm = pcm16k_buffer[:vad.VAD_CHUNK_BYTES]
+                pcm16k_buffer = pcm16k_buffer[vad.VAD_CHUNK_BYTES:]
+                
+                # 4. Run VAD
+                is_speech = vad.is_chunk_speech(current_chunk_pcm)
+                
+                # --- START FIX: UNIFIED LOGIC ---
+                
+                # 5. Interruption Check (runs in parallel to endpointing)
+                #    If user speaks WHILE agent is speaking, set the flag.
+                if is_speech and agent_is_speaking_event.is_set() and not interruption_event.is_set():
+                    print(f"[{session_id}] 💥 BARGE-IN DETECTED!")
+                    interruption_event.set() # Signal the Brain
+                
+                # 6. Endpointing Logic (always runs)
+                if is_speech:
+                    if not is_speaking:
+                        # This is the start of a new utterance
+                        # (either normal or an interruption)
+                        print(f"[{session_id}] 🎤 User started speaking...")
+                        is_speaking = True
+                        speech_buffer_pcm.clear()
+                    
+                    speech_buffer_pcm.extend(current_chunk_pcm)
+                    silent_chunks = 0
+                
+                elif not is_speech and is_speaking:
+                    # User was speaking, but this chunk is silent
+                    silent_chunks += 1
+                    if silent_chunks >= SILENT_CHUNKS_FOR_EOS:
+                        print(f"[{session_id}] 🛑 End of speech detected.")
+                        is_speaking = False
+                        
+                        # Transcribe the full buffer
+                        loop = asyncio.get_event_loop()
+                        transcript = await loop.run_in_executor(
+                            None, transcribe_audio, bytes(speech_buffer_pcm), "pcm16k"
+                        )
+                        speech_buffer_pcm.clear()
+                        
+                        if transcript.strip():
+                            print(f"[{session_id}] 📝 User: {transcript}")
+                            await websocket.send_json({
+                                "type": "transcript",
+                                "text": transcript
+                            })
+                            # Send transcript to the "Brain"
+                            await transcript_queue.put(transcript)
+                        else:
+                             print(f"[{session_id}] 🔇 VAD triggered, but Whisper found no text.")
+                
+                elif not is_speech and not is_speaking:
+                    # Standard silence, reset buffer
+                    silent_chunks = 0
+                    speech_buffer_pcm.clear()
+                    
+                # --- END FIX ---
+
+    except WebSocketDisconnect:
+        print(f"[{session_id}] 🔌 Receiver disconnected.")
+    except asyncio.CancelledError:
+        print(f"[{session_id}] Receiver cancelled.")
+    except Exception as e:
+        print(f"[{session_id}] ❌ Receiver error: {e}")
+        traceback.print_exc()
+    finally:
+        # Signal other tasks to shut down
+        print(f"[{session_id}] Receiver task exiting.")
+        await transcript_queue.put(None)
+
+# --- The Main WebSocket Endpoint ---
 @router.websocket("/ws/vicidial/{session_id}")
 async def websocket_vicidial(
     websocket: WebSocket, 
@@ -53,110 +267,68 @@ async def websocket_vicidial(
     agent: MedicareAgent = Depends(get_agent_manager)
 ):
     """
-    WebSocket for VICIdial/Asterisk integration with streaming.
-    - Receives: mulaw audio chunks
-    - Sends: mulaw audio chunks (streamed)
+    Main WebSocket endpoint with VAD (Step 3) and Interruption (Step 4).
+    Manages the three concurrent tasks.
     """
     await websocket.accept()
-    print(f"[{session_id}] 🔗 WebSocket connected for Telephony")
+    print(f"[{session_id}] 🔗 WebSocket connected with VAD/Interruption")
     
-    # Get/create the call buffer and set caller ID
+    # 1. Get/create call buffer
     caller_id = f"{websocket.client.host}:{websocket.client.port}"
     agent._get_buffer(session_id, caller_id=caller_id)
     
-    # --- Setup Queues and Tasks ---
-    sentence_queue = asyncio.Queue()
+    # 2. Create communication channels
+    transcript_queue = asyncio.Queue()
     audio_queue = asyncio.Queue()
+    interruption_event = asyncio.Event()
+    agent_is_speaking_event = asyncio.Event()
     
-    # Create the single audio sender task
-    sender_task = asyncio.create_task(
-        audio_sender_task(websocket, audio_queue, session_id)
-    )
-    
-    # Create placeholder tasks for agent pipeline
-    producer_task = None
-    consumer_task = None
-    
-    # --- Buffers for STT ---
-    # We use the simple 0.5s buffer for now. Step 3 will add VAD.
-    temp_stt_buffer_mulaw = bytearray()
-
+    # 3. Launch the three main tasks
+    tasks = []
     try:
-        # --- 1. Send Greeting ---
+        sender_task = asyncio.create_task(
+            audio_sender_task(websocket, audio_queue, session_id)
+        )
+        tasks.append(sender_task)
+        
+        handler_task = asyncio.create_task(
+            agent_handler_task(
+                session_id, transcript_queue, audio_queue, 
+                agent_is_speaking_event, interruption_event
+            )
+        )
+        tasks.append(handler_task)
+        
+        receiver_task = asyncio.create_task(
+            audio_receiver_task(
+                websocket, session_id, transcript_queue, 
+                agent_is_speaking_event, interruption_event
+            )
+        )
+        tasks.append(receiver_task)
+        
+        # 4. Send the greeting
         print(f"[{session_id}] 🎤 Sending greeting...")
-        producer_task = asyncio.create_task(
-            llm_producer(session_id, "", sentence_queue)
-        )
-        consumer_task = asyncio.create_task(
-            tts_consumer(sentence_queue, audio_queue, output_format="mulaw")
-        )
+        await transcript_queue.put("") # Empty string triggers greeting
         
-        # --- 2. Main Receive Loop ---
-        while True:
-            data = await websocket.receive_text()
-            msg = json.loads(data)
-            
-            if msg['type'] == 'audio_data':
-                mulaw_chunk = base64.b64decode(msg['audio'])
-                temp_stt_buffer_mulaw.extend(mulaw_chunk)
-                
-                # Check if we have enough audio to transcribe
-                while len(temp_stt_buffer_mulaw) >= MULAW_CHUNK_SIZE:
-                    audio_to_process = bytes(temp_stt_buffer_mulaw[:MULAW_CHUNK_SIZE])
-                    temp_stt_buffer_mulaw = temp_stt_buffer_mulaw[MULAW_CHUNK_SIZE:]
-                    
-                    # Transcribe in executor
-                    loop = asyncio.get_event_loop()
-                    transcript = await loop.run_in_executor(
-                        None, transcribe_audio, audio_to_process, "mulaw"
-                    )
-                    
-                    if transcript.strip():
-                        print(f"[{session_id}] 📝 User: {transcript}")
-                        await websocket.send_json({
-                            "type": "transcript",
-                            "text": transcript
-                        })
-                        
-                        # Check if agent is busy
-                        if producer_task and not producer_task.done():
-                            print(f"[{session_id}] ⚠️ User spoke, but agent is still thinking. (Interruption logic in Step 4)")
-                            # In Step 4, we will cancel the tasks here
-                            continue
-                        
-                        # If agent is free, start the pipeline
-                        print(f"[{session_id}] 🤖 Agent processing...")
-                        sentence_queue = asyncio.Queue() # Create new queue for this turn
-                        producer_task = asyncio.create_task(
-                            llm_producer(session_id, transcript, sentence_queue)
-                        )
-                        consumer_task = asyncio.create_task(
-                            tts_consumer(sentence_queue, audio_queue, output_format="mulaw")
-                        )
-
-            elif msg['type'] == 'hangup':
-                print(f"[{session_id}] 📞 Hangup received")
-                agent.end_call(session_id, "completed_hangup")
-                break
-                
-    except WebSocketDisconnect:
-        print(f"[{session_id}] 🔌 WebSocket disconnected")
-        agent.end_call(session_id, "disconnected")
+        # 5. Wait for any task to fail or disconnect
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        
+        print(f"[{session_id}] Main loop exiting, a task has completed.")
+        
     except Exception as e:
-        print(f"[{session_id}] ❌ Error: {e}")
+        print(f"[{session_id}] WebSocket main error: {e}")
         traceback.print_exc()
-        agent.end_call(session_id, "error")
     finally:
-        # --- Cleanup ---
-        print(f"[{session_id}] Cleaning up tasks...")
-        if producer_task and not producer_task.done():
-            producer_task.cancel()
-        if consumer_task and not consumer_task.done():
-            consumer_task.cancel()
+        # 6. Cleanup
+        print(f"[{session_id}] Cleaning up all tasks...")
+        for task in tasks:
+            if not task.done():
+                task.cancel()
         
-        # Send sentinel to audio sender to make it stop
-        if audio_queue:
-            await audio_queue.put(None)
-        if sender_task and not sender_task.done():
-            sender_task.cancel()
+        # Wait for tasks to *actually* cancel
+        await asyncio.gather(*tasks, return_exceptions=True)
+        
+        agent.end_call(session_id, "completed")
+        print(f"[{session_id}] Connection closed and call saved.")
 

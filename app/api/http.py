@@ -51,16 +51,18 @@ async def process_voice_message_streaming(
         )
         print(f"[{session_id}] User said: {user_text}")
         
-        # 2. Create queues
+        # 2. Create queues and event
         sentence_queue = asyncio.Queue(maxsize=10)
         audio_queue = asyncio.Queue(maxsize=5)
+        # Create a dummy event for the HTTP endpoint
+        interruption_event = asyncio.Event() 
         
         # 3. Start concurrent tasks
         producer_task = asyncio.create_task(
-            llm_producer(session_id, user_text, sentence_queue)
+            llm_producer(session_id, user_text, sentence_queue, interruption_event)
         )
         consumer_task = asyncio.create_task(
-            tts_consumer(sentence_queue, audio_queue)
+            tts_consumer(sentence_queue, audio_queue, interruption_event, output_format="wav")
         )
         
         # 4. Stream audio chunks back
@@ -80,18 +82,35 @@ async def process_voice_message_streaming(
 
 
 # --- Other useful HTTP endpoints from your first app.py ---
-
 @router.post("/api/text-message")
 async def text_message(request: dict, agent: MedicareAgent = Depends(get_agent_manager)):
     """Text-based message API for debugging"""
     session_id = request.get("session_id", "text_default")
     message = request.get("message", "")
     
+    # Create dummy event for text message
+    interruption_event = asyncio.Event()
+    sentence_queue = asyncio.Queue()
+    
     # Use the streaming processor, but just collect the response
     full_response = ""
-    async for chunk in agent.process_message_streaming(session_id, message):
-        if "sentence" in chunk:
-            full_response += chunk["sentence"] + " "
+    
+    async def text_consumer():
+        nonlocal full_response
+        while True:
+            sentence = await sentence_queue.get()
+            if sentence is None:
+                sentence_queue.task_done()
+                break
+            full_response += sentence + " "
+            sentence_queue.task_done()
+            
+    producer_task = asyncio.create_task(
+        llm_producer(session_id, message, sentence_queue, interruption_event)
+    )
+    consumer_task = asyncio.create_task(text_consumer())
+    
+    await asyncio.gather(producer_task, consumer_task)
     
     patient_info = agent.get_patient_info(session_id)
     
@@ -114,3 +133,4 @@ async def get_patient_info_endpoint(session_id: str, agent: MedicareAgent = Depe
     """Get patient information"""
     patient_info = agent.get_patient_info(session_id)
     return {"session_id": session_id, "patient_info": patient_info}
+
