@@ -88,9 +88,13 @@ async def agent_handler_task(
             producer_task = asyncio.create_task(
                 llm_producer(session_id, transcript, sentence_queue, interruption_event)
             )
+            
+            # --- CHANGE 1: Output WAV instead of MULAW ---
+            # This allows the browser to play the audio.
             consumer_task = asyncio.create_task(
-                tts_consumer(sentence_queue, audio_queue, interruption_event, output_format="mulaw")
+                tts_consumer(sentence_queue, audio_queue, interruption_event, output_format="wav")
             )
+            # --- END CHANGE 1 ---
 
             # 4. Wait for LLM to finish OR for an interruption
             interruption_wait_task = asyncio.create_task(
@@ -182,10 +186,17 @@ async def audio_receiver_task(
             if msg['type'] != 'audio_data':
                 continue
                 
-            # 2. Convert chunk to 16kHz PCM for VAD
-            mulaw_chunk = base64.b64decode(msg['audio'])
-            pcm16k_chunk, ratecv_state = convert_mulaw_chunk_to_pcm16k(mulaw_chunk, ratecv_state)
-            pcm16k_buffer.extend(pcm16k_chunk)
+            # --- CHANGE 2: Handle PCM from browser OR MULAW from Asterisk ---
+            if msg.get('format') == 'pcm16k':
+                # Browser client is sending 16kHz PCM directly
+                pcm16k_chunk = base64.b64decode(msg['audio'])
+                pcm16k_buffer.extend(pcm16k_chunk)
+            else:
+                # Original logic: Assume 8kHz mulaw
+                mulaw_chunk = base64.b64decode(msg['audio'])
+                pcm16k_chunk, ratecv_state = convert_mulaw_chunk_to_pcm16k(mulaw_chunk, ratecv_state)
+                pcm16k_buffer.extend(pcm16k_chunk)
+            # --- END CHANGE 2 ---
 
             # 3. Process buffer in VAD-sized chunks
             while len(pcm16k_buffer) >= vad.VAD_CHUNK_BYTES:
@@ -331,4 +342,3 @@ async def websocket_vicidial(
         
         agent.end_call(session_id, "completed")
         print(f"[{session_id}] Connection closed and call saved.")
-

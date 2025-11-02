@@ -1,0 +1,236 @@
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica,
+    Arial, sans-serif;
+  margin: 0;
+  padding: 20px;
+  background-color: #121212; /* Dark background */
+  color: #e0e0e0; /* Light text for readability */
+}
+
+h1 {
+  text-align: center;
+  color: #e0e0e0; /* Lighter text color */
+}
+
+.container {
+  max-width: 900px;
+  margin: 0 auto;
+  background: #1e1e1e; /* Dark container background */
+  border-radius: 12px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.1); /* Slight shadow for depth */
+  overflow: hidden;
+}
+
+.controls {
+  padding: 20px;
+  border-bottom: 1px solid #333; /* Darker separator */
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+
+.controls label {
+  font-weight: 600;
+  color: #b0b0b0; /* Lighter label color */
+}
+
+.controls input[type="text"] {
+  flex-grow: 1;
+  padding: 10px 14px;
+  border: 1px solid #444; /* Dark border */
+  border-radius: 6px;
+  font-size: 14px;
+  background-color: #333; /* Dark background for input */
+  color: #e0e0e0; /* Light text inside input */
+}
+
+.controls button {
+  padding: 10px 16px;
+  border: none;
+  border-radius: 6px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background-color 0.2s ease;
+  background-color: #3e4347; /* Dark button background */
+  color: white;
+}
+
+.controls button:hover {
+  background-color: #2c3135; /* Darker hover */
+}
+
+.controls button.secondary {
+  background-color: #555; /* Slightly lighter secondary button */
+}
+
+.controls button.secondary:hover {
+  background-color: #444; /* Darker secondary hover */
+}
+
+.status-bar {
+  display: flex;
+  align-items: center;
+  padding: 12px 20px;
+  background: #181818; /* Darker status bar */
+  border-bottom: 1px solid #333;
+  gap: 8px;
+}
+
+.status-light {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background-color: #666; /* Default gray light */
+  transition: background-color 0.3s ease;
+}
+
+.status-light.green {
+  background-color: #28a745;
+}
+
+.status-light.red {
+  background-color: #dc3545;
+}
+
+.status-light.yellow {
+  background-color: #ffc107;
+}
+
+.status-bar span {
+  font-size: 14px;
+  color: #aaa; /* Lighter text for status */
+  margin-right: 16px;
+}
+
+.call-controls {
+  display: flex;
+  justify-content: center;
+  gap: 20px;
+  padding: 20px;
+  border-bottom: 1px solid #333;
+}
+
+.call-controls button {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 16px;
+  font-weight: 600;
+  padding: 12px 24px;
+  border-radius: 30px;
+  border: none;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  color: white;
+}
+
+.call-controls button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.call-controls button svg {
+  width: 20px;
+  height: 20px;
+}
+
+#start-call-btn {
+  background-color: #28a745;
+}
+
+#start-call-btn:not(:disabled):hover {
+  background-color: #218838;
+}
+
+#hang-up-btn {
+  background-color: #dc3545;
+}
+
+#hang-up-btn:not(:disabled):hover {
+  background-color: #c82333;
+}
+
+.content {
+  display: flex;
+  flex-wrap: wrap;
+}
+
+.chat-container {
+  flex: 3;
+  min-width: 300px;
+  padding: 20px;
+  background: #222; /* Dark background for chat */
+  border-radius: 8px;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.1);
+}
+
+.state-container {
+  flex: 2;
+  min-width: 280px;
+  padding: 20px;
+  border-left: 1px solid #333;
+  background: #333; /* Dark background for state container */
+  color: #e0e0e0; /* Light text in state container */
+}
+
+#chat-log {
+  height: 400px;
+  overflow-y: auto;
+  border: 1px solid #444; /* Darker border */
+  border-radius: 8px;
+  padding: 15px;
+  background: #292929; /* Dark background for chat log */
+}
+
+.message {
+  margin-bottom: 12px;
+  padding: 10px 15px;
+  border-radius: 18px;
+  line-height: 1.5;
+  max-width: 85%;
+}
+
+.message.user {
+  background-color: #3a3d41; /* Dark user message background */
+  color: #e0e0e0;
+  margin-left: auto;
+  text-align: left;
+  border-bottom-right-radius: 4px;
+}
+
+.message.agent {
+  background-color: #444; /* Dark agent message background */
+  color: #e0e0e0;
+  margin-right: auto;
+  text-align: left;
+  border-bottom-left-radius: 4px;
+}
+
+.message.system {
+  background-color: #ffd700; /* Bright yellow for system messages */
+  color: #594b00;
+  font-style: italic;
+  text-align: center;
+  max-width: 100%;
+  font-size: 14px;
+}
+
+#agent-state {
+  background: #2c2f33; /* Darker state background */
+  border: 1px solid #444; /* Dark border */
+  border-radius: 8px;
+  padding: 15px;
+  height: 380px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  font-family: "Courier New", Courier, monospace;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+h3 {
+  margin-top: 0;
+  color: #e0e0e0; /* Lighter heading color */
+  border-bottom: 2px solid #333;
+  padding-bottom: 8px;
+}

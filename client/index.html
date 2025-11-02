@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AI Agent S2S Test UI</title>
+    <link rel="stylesheet" href="css/style.css" />
+  </head>
+  <body>
+    <div class="container">
+      <h1>AI Caller Agent (S2S Test)</h1>
+
+      <div class="controls">
+        <label for="session-id">Session ID:</label>
+        <input
+          type="text"
+          id="session-id"
+          placeholder="Enter a unique session ID"
+        />
+        <button id="get-info-btn" class="secondary">Get Patient Info</button>
+        <button
+          id="end-call-db-btn"
+          class="secondary"
+          title="Manually end and save call via HTTP"
+        >
+          Save Call (DB)
+        </button>
+      </div>
+
+      <div class="status-bar">
+        <div id="ws-status" class="status-light" title="WebSocket Status"></div>
+        <span id="ws-status-text">Disconnected</span>
+        <div
+          id="mic-status"
+          class="status-light"
+          title="Microphone Status"
+        ></div>
+        <span id="mic-status-text">Mic Off</span>
+        <div
+          id="agent-status"
+          class="status-light"
+          title="Agent Speaking Status"
+        ></div>
+        <span id="agent-status-text">Agent Idle</span>
+      </div>
+
+      <div class="call-controls">
+        <button id="start-call-btn">
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            width="24"
+            height="24"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          >
+            <path
+              d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.63A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"
+            ></path>
+          </svg>
+          Start Call
+        </button>
+        <button id="hang-up-btn" class="hang-up" disabled>
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            width="24"
+            height="24"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          >
+            <path
+              d="M10.68 13.31a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7 2 2 0 0 1 1.72 2v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.63A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91"
+            ></path>
+            <line x1="22" y1="2" x2="2" y2="22"></line>
+          </svg>
+          Hang Up
+        </button>
+      </div>
+
+      <div class="content">
+        <div class="chat-container">
+          <h3>Conversation Transcript</h3>
+          <div id="chat-log">
+            <div class="message system">Click "Start Call" to connect.</div>
+          </div>
+        </div>
+        <div class="state-container">
+          <h3>Agent State (Patient Info)</h3>
+          <pre id="agent-state">{}</pre>
+        </div>
+      </div>
+    </div>
+
+    <script src="js/app.js"></script>
+  </body>
+</html>
