@@ -129,6 +129,76 @@ def synthesize_speech(text: str, output_format: str = "wav", voice: str = None) 
             buffer.seek(0)
             return buffer.read()
 
+def synthesize_speech(text: str, output_format: str = "wav", voice: str = None) -> bytes:
+    """
+    Synchronous TTS synthesis.
+    Converts text to speech and returns bytes in the specified format.
+    """
+    if tts_model is None:
+        raise Exception("TTS model not initialized")
+    
+    if voice is None:
+        voice = KOKORO_VOICE
+    
+    try:
+        result = tts_model(text, voice=voice, speed=1.2)
+        audio_array, sample_rate = _get_audio_array_from_tts_result(result)
+        
+        if output_format == "mulaw":
+            # Better resampling for μ-law
+            if sample_rate != 8000:
+                # Use scipy for high-quality resampling
+                num_samples = int(len(audio_array) * 8000 / sample_rate)
+                audio_array = scipy.signal.resample(audio_array, num_samples)
+                sample_rate = 8000
+            
+            # Ensure clipping to prevent distortion
+            audio_array = np.clip(audio_array, -1.0, 1.0)
+            
+            # Convert to 16-bit PCM
+            pcm_data = (audio_array * 32767).astype(np.int16).tobytes()
+            
+            # Convert to μ-law
+            mulaw_data = audioop.lin2ulaw(pcm_data, 2)
+            
+            print(f"[TTS] Converted to μ-law: {len(mulaw_data)} bytes, sample_rate: 8000Hz")
+            return mulaw_data
+        
+        elif output_format == "pcm16k":
+            if sample_rate != 16000:
+                num_samples = int(len(audio_array) * 16000 / sample_rate)
+                audio_array = scipy.signal.resample(audio_array, num_samples)
+            
+            pcm_data = (audio_array * 32767).astype(np.int16).tobytes()
+            return pcm_data
+        
+        else:  # Default to WAV
+            buffer = io.BytesIO()
+            sf.write(buffer, audio_array, sample_rate, format='WAV')
+            buffer.seek(0)
+            return buffer.read()
+    
+    except Exception as e:
+        print(f"❌ TTS Error: {e}")
+        traceback.print_exc()
+        
+        # Fallback: return silence
+        sample_rate = 8000 if output_format == "mulaw" else (16000 if output_format == "pcm16k" else 24000)
+        duration = max(2.0, len(text.split()) * 0.5)
+        samples = int(duration * sample_rate)
+        audio_array = np.zeros(samples, dtype=np.float32)
+        
+        if output_format == "mulaw":
+            pcm_data = (audio_array * 32767).astype(np.int16).tobytes()
+            return audioop.lin2ulaw(pcm_data, 2)
+        elif output_format == "pcm16k":
+            return (audio_array * 32767).astype(np.int16).tobytes()
+        else:
+            buffer = io.BytesIO()
+            sf.write(buffer, audio_array, sample_rate, format='WAV')
+            buffer.seek(0)
+            return buffer.read()
+
 def synthesize_speech_for_pipeline(text: str, output_format: str = "wav", voice: str = None) -> bytes:
     """
     Synchronous TTS synthesis wrapper for the streaming pipeline.

@@ -27,8 +27,8 @@ let agentIsSpeaking = false;
 // const SERVER_HOST = window.location.host;
 // const WEBSOCKET_URL = `ws://${SERVER_HOST}/ws/vicidial/`;
 // const HTTP_URL = `http://${SERVER_HOST}/api/`;
-const WEBSOCKET_URL = `ws://localhost:8000/ws/vicidial/`;
-const HTTP_URL = `http://localhost:8000/api/`;
+const WEBSOCKET_URL = `wss://8000-dep-01k9272p639md822bpqr840709-d.cloudspaces.litng.ai/ws/vicidial/`;
+const HTTP_URL = `https://8000-dep-01k9272p639md822bpqr840709-d.cloudspaces.litng.ai/api/`;
 
 // --- Initialization ---
 sessionIdInput.value = "browser-test-" + Date.now();

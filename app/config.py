@@ -11,7 +11,7 @@ if not GOOGLE_API_KEY:
     print("Warning: GOOGLE_API_KEY environment variable not set!")
 
 # --- Model Config ---
-WHISPER_MODEL = os.getenv("WHISPER_MODEL", "openai/whisper-base")
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "openai/whisper-large-v3-turbo")
 KOKORO_VOICE = os.getenv("KOKORO_VOICE", "af_heart")
 KOKORO_LANG = os.getenv("KOKORO_LANG", "a")
 
