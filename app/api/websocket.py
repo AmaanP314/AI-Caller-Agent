@@ -7,7 +7,8 @@ from app.streaming.manager import MedicareAgent
 from app.api.http import get_agent_manager # Reuse the dependency
 from app.audio.stt import transcribe_audio
 from app.audio import vad
-from app.audio.utils import convert_mulaw_chunk_to_pcm16k
+# --- CHANGE 1: Remove mulaw converter ---
+# from app.audio.utils import convert_mulaw_chunk_to_pcm16k
 from app.streaming.pipeline import llm_producer, tts_consumer
 from app.config import VAD_SILENCE_TIMEOUT_MS
 
@@ -37,14 +38,19 @@ async def audio_sender_task(
         while True:
             audio_chunk = await audio_queue.get()
             
-            # This task is permanent. It only dies when the WebSocket
-            # disconnects. We no longer check for a None sentinel.
-            
+            if audio_chunk is None:
+                print(f"[{session_id}] Audio sender: TTS turn complete (ignoring sentinel).")
+                audio_queue.task_done()
+                continue
+
             chunk_b64 = base64.b64encode(audio_chunk).decode('utf-8')
             
+            # --- ADD sample_rate field ---
             await websocket.send_json({
                 "type": "audio_response",
-                "audio": chunk_b64
+                "audio": chunk_b64,
+                "sample_rate": 8000,  # ← ADD THIS LINE
+                "format": "pcm8k"      # ← ADD THIS LINE (optional but helpful)
             })
             audio_queue.task_done()
             
@@ -88,8 +94,10 @@ async def agent_handler_task(
             producer_task = asyncio.create_task(
                 llm_producer(session_id, transcript, sentence_queue, interruption_event)
             )
+            
+            # --- CHANGE 2: Request pcm8k instead of mulaw ---
             consumer_task = asyncio.create_task(
-                tts_consumer(sentence_queue, audio_queue, interruption_event, output_format="mulaw")
+                tts_consumer(sentence_queue, audio_queue, interruption_event, output_format="pcm8k")
             )
 
             # 4. Wait for LLM to finish OR for an interruption
@@ -158,7 +166,8 @@ async def audio_receiver_task(
         return
 
     # VAD State
-    ratecv_state = None
+    # --- CHANGE 3: Remove ratecv_state ---
+    # ratecv_state = None
     pcm16k_buffer = bytearray()
     speech_buffer_pcm = bytearray()
     is_speaking = False
@@ -181,16 +190,23 @@ async def audio_receiver_task(
             
             if msg['type'] != 'audio_data':
                 continue
+            
+            # --- CHANGE 4: Expect pcm16k, remove conversion ---
+            if msg.get('format') != 'pcm16k':
+                print(f"[{session_id}] ⚠️ Received wrong format: {msg.get('format')}, skipping")
+                continue
                 
-            # 2. Convert chunk to 16kHz PCM for VAD
-            mulaw_chunk = base64.b64decode(msg['audio'])
-            print(f"[{session_id}] 📥 Received {len(mulaw_chunk)} bytes μ-law")  # ← ADD THIS
+            pcm16k_chunk = base64.b64decode(msg['audio'])
+            print(f"[{session_id}] 📥 Received {len(pcm16k_chunk)} bytes pcm16k")
 
-            pcm16k_chunk, ratecv_state = convert_mulaw_chunk_to_pcm16k(mulaw_chunk, ratecv_state)
-            print(f"[{session_id}] 🔄 Converted to {len(pcm16k_chunk)} bytes PCM16k")  # ← ADD THIS
-
+            # We no longer need this conversion:
+            # mulaw_chunk = base64.b64decode(msg['audio'])
+            # pcm16k_chunk, ratecv_state = convert_mulaw_chunk_to_pcm16k(mulaw_chunk, ratecv_state)
+            
+            # The relay will send 640-byte chunks (20ms @ 16k)
+            # We buffer them to get 1024-byte chunks (32ms @ 16k) for VAD
             pcm16k_buffer.extend(pcm16k_chunk)
-            print(f"[{session_id}] 📊 Buffer now has {len(pcm16k_buffer)} bytes (need {vad.VAD_CHUNK_BYTES})")  # ← ADD THIS
+            print(f"[{session_id}] 📊 Buffer now has {len(pcm16k_buffer)} bytes (need {vad.VAD_CHUNK_BYTES})")
 
 
             # 3. Process buffer in VAD-sized chunks
@@ -201,7 +217,7 @@ async def audio_receiver_task(
                 # 4. Run VAD
                 is_speech = vad.is_chunk_speech(current_chunk_pcm)
                 
-                # --- START FIX: UNIFIED LOGIC ---
+                # --- START UNIFIED LOGIC ---
                 
                 # 5. Interruption Check (runs in parallel to endpointing)
                 #    If user speaks WHILE agent is speaking, set the flag.
@@ -224,6 +240,10 @@ async def audio_receiver_task(
                 elif not is_speech and is_speaking:
                     # User was speaking, but this chunk is silent
                     silent_chunks += 1
+                    # --- ADDED THIS LINE ---
+                    # We should still buffer the silence in case speech resumes
+                    speech_buffer_pcm.extend(current_chunk_pcm)
+                    
                     if silent_chunks >= SILENT_CHUNKS_FOR_EOS:
                         print(f"[{session_id}] 🛑 End of speech detected.")
                         is_speaking = False
@@ -249,9 +269,11 @@ async def audio_receiver_task(
                 elif not is_speech and not is_speaking:
                     # Standard silence, reset buffer
                     silent_chunks = 0
+                    # We clear the buffer to prevent old audio from
+                    # being transcribed on the next utterance.
                     speech_buffer_pcm.clear()
                     
-                # --- END FIX ---
+                # --- END UNIFIED LOGIC ---
 
     except WebSocketDisconnect:
         print(f"[{session_id}] 🔌 Receiver disconnected.")
@@ -281,6 +303,7 @@ async def websocket_vicidial(
     
     # 1. Get/create call buffer
     caller_id = f"{websocket.client.host}:{websocket.client.port}"
+    # --- CHANGE 5: Pass caller_id to _get_buffer ---
     agent._get_buffer(session_id, caller_id=caller_id)
     
     # 2. Create communication channels
