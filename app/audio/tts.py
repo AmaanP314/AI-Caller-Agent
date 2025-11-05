@@ -32,17 +32,14 @@ def _get_audio_array_from_tts_result(result):
             if chunk_obj is None:
                 continue
             
-            # Handle KPipeline.Result object
             audio_data = None
             if hasattr(chunk_obj, 'output') and hasattr(chunk_obj.output, 'audio'):
                 audio_data = chunk_obj.output.audio
-            # Handle raw generator output
             elif hasattr(chunk_obj, 'audio'):
                  audio_data = chunk_obj.audio
-            # Handle tuple/dict in generator
             elif isinstance(chunk_obj, (tuple, dict)):
                 audio_data, sr_chunk = _get_audio_array_from_tts_result(chunk_obj)
-                sample_rate = sr_chunk # Update sample rate from chunk
+                sample_rate = sr_chunk
             else:
                 audio_data = chunk_obj
 
@@ -73,7 +70,6 @@ def _get_audio_array_from_tts_result(result):
     return audio_array, sample_rate
 
 # --- MODIFIED FUNCTION ---
-# (I consolidated your duplicate synthesize_speech function into one)
 def synthesize_speech(text: str, output_format: str = "wav", voice: str = None) -> bytes:
     """
     Synchronous TTS synthesis.
@@ -99,7 +95,6 @@ def synthesize_speech(text: str, output_format: str = "wav", voice: str = None) 
                 audio_array = scipy.signal.resample(audio_array, num_samples)
                 sample_rate = target_rate
             
-            # Ensure clipping to prevent distortion
             audio_array = np.clip(audio_array, -1.0, 1.0)
             
             # Convert to 16-bit PCM (slin@8k)
@@ -129,7 +124,6 @@ def synthesize_speech(text: str, output_format: str = "wav", voice: str = None) 
         traceback.print_exc()
         
         # --- FALLBACK CHANGE ---
-        # Updated fallback to support pcm8k
         sample_rate = 8000 if output_format == "pcm8k" else (16000 if output_format == "pcm16k" else 24000)
         duration = max(2.0, len(text.split()) * 0.5)
         samples = int(duration * sample_rate)
@@ -146,8 +140,5 @@ def synthesize_speech(text: str, output_format: str = "wav", voice: str = None) 
 def synthesize_speech_for_pipeline(text: str, output_format: str = "wav", voice: str = None) -> bytes:
     """
     Synchronous TTS synthesis wrapper for the streaming pipeline.
-    This is what the tts_consumer calls.
-    Returns audio bytes in the requested format.
     """
-    # This just passes the call through to the main function
     return synthesize_speech(text, output_format=output_format, voice=voice)

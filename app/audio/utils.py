@@ -85,3 +85,25 @@ def convert_mulaw_chunk_to_pcm16k(mulaw_chunk: bytes, ratecv_state):
     print(f"[UTILS] After ratecv: {len(pcm_16k)} bytes PCM 16kHz")  # ← ADD
     
     return pcm_16k, new_state
+
+def mulaw_to_pcm16k_bytes(mulaw_bytes: bytes) -> bytes:
+    """
+    (Batch) Convert 8kHz mulaw audio bytes to 16kHz 16-bit PCM audio bytes.
+    - This is still used by the HTTP endpoint (stt.py)
+    - mulaw (from Asterisk) -> 8kHz PCM -> 16kHz PCM (for Whisper)
+    """
+    # 1. Mulaw to linear PCM (8kHz, 16-bit)
+    pcm_data = audioop.ulaw2lin(mulaw_bytes, 2)
+    
+    # 2. Load into Pydub
+    audio_seg = AudioSegment(
+        data=pcm_data,
+        sample_width=2,
+        frame_rate=8000,
+        channels=1
+    )
+    
+    # 3. Resample to 16kHz
+    audio_seg = audio_seg.set_frame_rate(16000)
+    
+    return audio_seg.raw_data
