@@ -8,10 +8,9 @@ from app.streaming.manager import MedicareAgent
 from app.api.http import get_agent_manager # Reuse the dependency
 from app.audio.stt import transcribe_audio
 from app.audio import vad
-# --- REMOVED mulaw converter ---
 from app.streaming.pipeline import llm_producer, tts_consumer
 from app.config import VAD_SILENCE_TIMEOUT_MS
-
+from app.audio.utils import resample_pcm8k_to_pcm16k_scipy
 router = APIRouter()
 
 # --- Helper to clear queues on interruption ---
@@ -128,7 +127,6 @@ async def agent_handler_task(
         print(f"[{session_id}] Agent handler task exiting.")
 
 
-# --- Task 3: The "Ears" (Audio Receiver + VAD + Resampler) ---
 async def audio_receiver_task(
     websocket: WebSocket,
     session_id: str,
@@ -137,23 +135,27 @@ async def audio_receiver_task(
     interruption_event: asyncio.Event
 ):
     """
-    Receives pcm8k, resamples to pcm16k, runs VAD, 
-    and handles endpointing and interruption.
+    Receives pcm8k, buffers it, resamples to pcm16k using Scipy,
+    runs VAD, and handles endpointing.
     """
     vad_model, vad_utils = vad.get_vad_model()
     if vad_model is None:
         print(f"[{session_id}] VAD model not loaded. Receiver task cannot start.")
         return
 
-    # --- CHANGE 3: Add resampler state ---
-    ratecv_state = None 
-    pcm16k_buffer = bytearray()
-    speech_buffer_pcm = bytearray()
+    # VAD State
+    pcm16k_buffer = bytearray() # Buffer for VAD-sized chunks
+    speech_buffer_pcm = bytearray() # Buffer for full utterance
     is_speaking = False
     silent_chunks = 0
     
-    MS_PER_CHUNK = (vad.VAD_CHUNK_SAMPLES / vad.VAD_SAMPLE_RATE) * 1000 # 32ms
-    SILENT_CHUNKS_FOR_EOS = int(VAD_SILENCE_TIMEOUT_MS / MS_PER_CHUNK) # ~31
+    # --- NEW: Buffer for 8k->16k resampling ---
+    pcm8k_resample_buffer = bytearray()
+    RESAMPLE_BATCH_MS = 100 # Resample in 100ms batches
+    RESAMPLE_BATCH_BYTES = int(8000 * 2 * (RESAMPLE_BATCH_MS / 1000)) # 8000*2*0.1 = 1600 bytes
+    
+    MS_PER_VAD_CHUNK = (vad.VAD_CHUNK_SAMPLES / vad.VAD_SAMPLE_RATE) * 1000 # 32ms
+    SILENT_CHUNKS_FOR_EOS = int(VAD_SILENCE_TIMEOUT_MS / MS_PER_VAD_CHUNK) # ~31
     
     try:
         while True:
@@ -168,37 +170,42 @@ async def audio_receiver_task(
             if msg['type'] != 'audio_data':
                 continue
             
-            # --- CHANGE 4: Expect pcm8k from relay ---
             if msg.get('format') != 'pcm8k':
                 print(f"[{session_id}] ⚠️ Received wrong format: {msg.get('format')}, skipping")
                 continue
                 
             pcm8k_chunk = base64.b64decode(msg['audio'])
-            print(f"[{session_id}] 📥 Received {len(pcm8k_chunk)} bytes pcm8k")
+            pcm8k_resample_buffer.extend(pcm8k_chunk)
 
-            # --- CHANGE 5: Resample 8kHz -> 16kHz ---
-            # 2 = 2 bytes (16-bit), 1 = mono, 8000 = in, 16000 = out
-            pcm16k_chunk, ratecv_state = audioop.ratecv(
-                pcm8k_chunk, 2, 1, 8000, 16000, ratecv_state
-            )
-            
-            # Add resampled chunk to VAD buffer
-            pcm16k_buffer.extend(pcm16k_chunk)
-            print(f"[{session_id}] 📊 Resampled to {len(pcm16k_chunk)} bytes. Buffer: {len(pcm16k_buffer)} (need {vad.VAD_CHUNK_BYTES})")
+            # --- NEW: Resample in 100ms batches ---
+            while len(pcm8k_resample_buffer) >= RESAMPLE_BATCH_BYTES:
+                # 1. Get 100ms batch of pcm8k
+                pcm8k_batch = pcm8k_resample_buffer[:RESAMPLE_BATCH_BYTES]
+                pcm8k_resample_buffer = pcm8k_resample_buffer[RESAMPLE_BATCH_BYTES:]
+                
+                # 2. Resample 8k -> 16k using scipy
+                loop = asyncio.get_event_loop()
+                pcm16k_batch = await loop.run_in_executor(
+                    None, resample_pcm8k_to_pcm16k_scipy, pcm8k_batch
+                )
+                
+                if not pcm16k_batch:
+                    continue # Resampling failed
+                
+                # 3. Add resampled audio to VAD buffer
+                pcm16k_buffer.extend(pcm16k_batch)
 
-            # Process buffer in VAD-sized chunks (1024 bytes)
+            # --- VAD Logic (unchanged) ---
             while len(pcm16k_buffer) >= vad.VAD_CHUNK_BYTES:
                 current_chunk_pcm = pcm16k_buffer[:vad.VAD_CHUNK_BYTES]
                 pcm16k_buffer = pcm16k_buffer[vad.VAD_CHUNK_BYTES:]
                 
                 is_speech = vad.is_chunk_speech(current_chunk_pcm)
                 
-                # Interruption Check
                 if is_speech and agent_is_speaking_event.is_set() and not interruption_event.is_set():
                     print(f"[{session_id}] 💥 BARGE-IN DETECTED!")
                     interruption_event.set()
                 
-                # Endpointing Logic
                 if is_speech:
                     if not is_speaking:
                         print(f"[{session_id}] 🎤 User started speaking...")
@@ -217,7 +224,6 @@ async def audio_receiver_task(
                         is_speaking = False
                         
                         loop = asyncio.get_event_loop()
-                        # --- CHANGE 6: Pass pcm16k to STT ---
                         transcript = await loop.run_in_executor(
                             None, transcribe_audio, bytes(speech_buffer_pcm), "pcm16k"
                         )

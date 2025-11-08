@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-AudioSocket Relay - NATIVE PCM (SLIN) TRANSLATOR
-Asterisk (slin@8k) <-> Agent (slin@16k)
+AudioSocket Relay - NATIVE PCM (SLIN) "DUMB" PROXY
+Asterisk (slin@8k) <-> Agent (pcm8k)
+WITH 100ms BUFFER-AND-BURST PACING
 """
 import asyncio
 import websockets
@@ -9,7 +10,6 @@ import json
 import base64
 import struct
 from datetime import datetime
-import audioop  # For resampling
 
 # --- CONFIGURATION ---
 LIGHTNING_AI_URL = "wss://8000-dep-01k92g7yv2tx4dsrq54rn6r5ak-d.cloudspaces.litng.ai/ws/vicidial"
@@ -22,35 +22,15 @@ TYPE_AUDIO_SLIN8K = 0x10  # This is slin@8k (PCM 16-bit)
 TYPE_HANGUP = 0x00
 
 # --- AUDIO CONSTANTS ---
-# Asterisk sends 20ms chunks of 8kHz 16-bit PCM
 ASTERISK_CHUNK_MS = 20
 ASTERISK_SAMPLE_RATE = 8000
 ASTERISK_SAMPLE_WIDTH = 2  # 16-bit
-ASTERISK_CHUNK_BYTES = int(ASTERISK_SAMPLE_RATE * (ASTERISK_CHUNK_MS / 1000) * ASTERISK_SAMPLE_WIDTH) # 320 bytes
+ASTERISK_CHUNK_BYTES = 320 # 20ms of slin@8k (8000 * 0.02 * 2)
 
-# Agent speaks/listens at 16kHz 16-bit PCM
-AGENT_SAMPLE_RATE = 16000
-AGENT_SAMPLE_WIDTH = 2 # 16-bit
-AGENT_CHUNK_BYTES = int(AGENT_SAMPLE_RATE * (ASTERISK_CHUNK_MS / 1000) * AGENT_SAMPLE_WIDTH) # 640 bytes
-
-class AudioResampler:
-    """Stateful resampler using audioop.ratecv"""
-    def __init__(self, from_rate, to_rate, width):
-        self.from_rate = from_rate
-        self.to_rate = to_rate
-        self.width = width
-        self.state = None # audioop.ratecv state
-
-    def resample(self, chunk: bytes) -> bytes:
-        new_chunk, self.state = audioop.ratecv(
-            chunk,
-            self.width,
-            1, # Mono
-            self.from_rate,
-            self.to_rate,
-            self.state
-        )
-        return new_chunk
+# --- PACING FIX ---
+# We will buffer 100ms of audio and send it in one burst
+PACING_BUFFER_MS = 100
+CHUNKS_PER_BURST = int(PACING_BUFFER_MS / ASTERISK_CHUNK_MS) # 100ms / 20ms = 5 chunks
 
 async def handle_call(reader, writer):
     session_id = f"call-{int(datetime.now().timestamp())}"
@@ -69,16 +49,9 @@ async def handle_call(reader, writer):
 
         async with websockets.connect(ws_url, ping_interval=20) as ws:
             print(f"[{session_id}] ✅ Connected to AI")
-
-            # Create a stateful resampler for this call
-            resampler = AudioResampler(
-                from_rate=ASTERISK_SAMPLE_RATE,
-                to_rate=AGENT_SAMPLE_RATE,
-                width=ASTERISK_SAMPLE_WIDTH
-            )
-
+            
             await asyncio.gather(
-                forward_asterisk_to_ai(reader, ws, session_id, resampler),
+                forward_asterisk_to_ai(reader, ws, session_id),
                 forward_ai_to_asterisk(ws, writer, session_id)
             )
 
@@ -89,8 +62,8 @@ async def handle_call(reader, writer):
         await writer.wait_closed()
         print(f"[{session_id}] 📴 Call ended")
 
-async def forward_asterisk_to_ai(reader, ws, session_id, resampler: AudioResampler):
-    """Asterisk (slin@8k) → Resample (slin@16k) → AI (slin@16k)"""
+async def forward_asterisk_to_ai(reader, ws, session_id):
+    """Asterisk (slin@8k) → Pass-through → AI (pcm8k)"""
     count = 0
     try:
         while True:
@@ -110,20 +83,15 @@ async def forward_asterisk_to_ai(reader, ws, session_id, resampler: AudioResampl
                 await reader.read(length) # Discard payload
                 continue
 
-            # 1. Read slin@8k (PCM) audio from Asterisk
             audio_slin_8k = await reader.read(length)
             if not audio_slin_8k:
                 break
 
-            # 2. Resample: slin@8k -> slin@16k
-            audio_slin_16k = resampler.resample(audio_slin_8k)
-
-            # 3. Send slin@16k to AI
             count += 1
             await ws.send(json.dumps({
                 "type": "audio_data",
-                "audio": base64.b64encode(audio_slin_16k).decode(),
-                "format": "pcm16k" # This is now TRUE
+                "audio": base64.b64encode(audio_slin_8k).decode(),
+                "format": "pcm8k" # Tell the agent it's 8kHz PCM
             }))
 
             if count % 50 == 0:
@@ -133,58 +101,49 @@ async def forward_asterisk_to_ai(reader, ws, session_id, resampler: AudioResampl
         print(f"[{session_id}] ⚠️  A→AI: {e}")
 
 async def forward_ai_to_asterisk(ws, writer, session_id):
-    """AI (slin@8k) → Pass-through → Asterisk (slin@8k)"""
-
-    # Since agent now sends 8kHz directly, no resampling needed
-    # But we keep the infrastructure in case we need it later
-    downsampler = None
+    """AI (pcm8k) → Pass-through (paced) → Asterisk (slin@8k)"""
 
     def write_audio_frame(data_slin_8k):
         """Writes a slin@8k (PCM) audio frame to Asterisk"""
         frame = struct.pack('B', TYPE_AUDIO_SLIN8K) + struct.pack('>H', len(data_slin_8k)) + data_slin_8k
         writer.write(frame)
 
+    audio_buffer = bytearray()
+    
     try:
         while True:
             msg = await ws.recv()
             data = json.loads(msg)
 
             if data.get('type') == 'audio_response':
-                # 1. Receive audio from AI (16kHz or 24kHz PCM)
-                audio_from_ai = base64.b64decode(data['audio'])
-
-                # Determine AI audio rate from your backend
-                ai_sample_rate = data.get('sample_rate', 24000)  # Default to 24kHz if not specified
-
-                # Initialize downsampler on first audio packet
-                if downsampler is None:
-                    downsampler = AudioResampler(
-                        from_rate=ai_sample_rate,
-                        to_rate=ASTERISK_SAMPLE_RATE,  # 8000 Hz
-                        width=AGENT_SAMPLE_WIDTH  # 16-bit
-                    )
-
-                # 2. Downsample AI audio to 8kHz for Asterisk
-                audio_slin_8k = downsampler.resample(audio_from_ai)
-
-                print(f"[{session_id}] 🔊 Received {len(audio_from_ai)}B @{ai_sample_rate}Hz → {len(audio_slin_8k)}B @8kHz")
-
+                audio_slin_8k = base64.b64decode(data['audio'])
+                print(f"[{session_id}] 🔊 Received {len(audio_slin_8k)} bytes (pcm8k) from AI")
                 if 'text' in data:
                     print(f"[{session_id}] 🗣️  {data['text'][:50]}...")
+                
+                # Add received audio to our buffer
+                audio_buffer.extend(audio_slin_8k)
 
-                # 3. Send in 20ms chunks (320 bytes for slin@8k)
-                for i in range(0, len(audio_slin_8k), ASTERISK_CHUNK_BYTES):
-                    chunk_slin_8k = audio_slin_8k[i:i+ASTERISK_CHUNK_BYTES]
-                    if not chunk_slin_8k:
-                        break
-
-                    if len(chunk_slin_8k) < ASTERISK_CHUNK_BYTES:
-                        chunk_slin_8k += b'\x00' * (ASTERISK_CHUNK_BYTES - len(chunk_slin_8k))
-
-                    # 4. Write slin@8k frame to Asterisk and pace
-                    write_audio_frame(chunk_slin_8k)
+                # --- PACING FIX ---
+                # Calculate total chunks needed for 100ms
+                total_bytes_for_burst = ASTERISK_CHUNK_BYTES * CHUNKS_PER_BURST # 320 * 5 = 1600 bytes
+                
+                # Send audio in 100ms (1600 byte) bursts
+                while len(audio_buffer) >= total_bytes_for_burst:
+                    # 1. Get the 100ms burst
+                    burst_data = audio_buffer[:total_bytes_for_burst]
+                    audio_buffer = audio_buffer[total_bytes_for_burst:]
+                    
+                    # 2. Send all chunks for this burst
+                    for i in range(0, len(burst_data), ASTERISK_CHUNK_BYTES):
+                        chunk = burst_data[i:i+ASTERISK_CHUNK_BYTES]
+                        if len(chunk) == ASTERISK_CHUNK_BYTES:
+                            write_audio_frame(chunk)
+                    
+                    # 3. Drain and sleep for 100ms
                     await writer.drain()
-                    await asyncio.sleep(0.02)  # 20ms pacing
+                    await asyncio.sleep(PACING_BUFFER_MS / 1000.0) # 0.1s
+                # --- END PACING FIX ---
 
             elif data.get('type') == 'transcript':
                 print(f"[{session_id}] 📝 User: {data['text']}")
@@ -201,9 +160,9 @@ async def forward_ai_to_asterisk(ws, writer, session_id):
 async def main():
     server = await asyncio.start_server(handle_call, HOST, PORT)
     print(f"\n{'='*60}")
-    print(f"🚀 AudioSocket Relay (Native PCM) Started")
-    print(f"📍 {HOST}:{PORT} (Speaking SLIN@8k to Asterisk)")
-    print(f"📡 → {LIGHTNING_AI_URL} (Speaking SLIN@16k to Agent)")
+    print(f"🚀 AudioSocket Relay (Native PCM Proxy) Started")
+    print(f"📍 {HOST}:{PORT} (Speaking SLIN@8k <-> SLIN@8k)")
+    print(f"📡 → {LIGHTNING_AI_URL} (Speaking PCM8k <-> PCM16k)")
     print(f"{'='*60}\n")
 
     async with server:
