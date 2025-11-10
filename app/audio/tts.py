@@ -3,12 +3,10 @@ import inspect
 import traceback
 import numpy as np
 import soundfile as sf
-import audioop
 import scipy.signal
-from pydub import AudioSegment
 from app.config import KOKORO_VOICE, KOKORO_LANG
 
-# This will be initialized in main.py and passed
+# This will be initialized in main.py
 tts_model = None
 
 def set_tts_model(model):
@@ -36,7 +34,7 @@ def _get_audio_array_from_tts_result(result):
             if hasattr(chunk_obj, 'output') and hasattr(chunk_obj.output, 'audio'):
                 audio_data = chunk_obj.output.audio
             elif hasattr(chunk_obj, 'audio'):
-                 audio_data = chunk_obj.audio
+                audio_data = chunk_obj.audio
             elif isinstance(chunk_obj, (tuple, dict)):
                 audio_data, sr_chunk = _get_audio_array_from_tts_result(chunk_obj)
                 sample_rate = sr_chunk
@@ -69,11 +67,10 @@ def _get_audio_array_from_tts_result(result):
         
     return audio_array, sample_rate
 
-# --- MODIFIED FUNCTION ---
 def synthesize_speech(text: str, output_format: str = "wav", voice: str = None) -> bytes:
     """
     Synchronous TTS synthesis.
-    Converts text to speech and returns bytes in the specified format.
+    FIXED: Generate pcm16k - let relay handle downsampling with stateful resampler.
     """
     if tts_model is None:
         raise Exception("TTS model not initialized")
@@ -85,27 +82,26 @@ def synthesize_speech(text: str, output_format: str = "wav", voice: str = None) 
         result = tts_model(text, voice=voice, speed=1.2)
         audio_array, sample_rate = _get_audio_array_from_tts_result(result)
         
-        # --- START CHANGE ---
-        # Replaced "mulaw" with "pcm8k"
-        if output_format == "pcm8k":
-            target_rate = 8000
+        # FIXED: Generate pcm16k instead of pcm8k
+        if output_format == "pcm16k":
+            target_rate = 16000
             if sample_rate != target_rate:
-                # Use scipy for high-quality resampling
+                # High-quality scipy resampling for ONE-TIME conversion
                 num_samples = int(len(audio_array) * target_rate / sample_rate)
                 audio_array = scipy.signal.resample(audio_array, num_samples)
                 sample_rate = target_rate
             
             audio_array = np.clip(audio_array, -1.0, 1.0)
             
-            # Convert to 16-bit PCM (slin@8k)
+            # Convert to 16-bit PCM
             pcm_data = (audio_array * 32767).astype(np.int16).tobytes()
             
-            print(f"[TTS] Converted to pcm8k: {len(pcm_data)} bytes, sample_rate: 8000Hz")
+            print(f"[TTS] Generated pcm16k: {len(pcm_data)} bytes @ 16kHz")
             return pcm_data
-        # --- END CHANGE ---
         
-        elif output_format == "pcm16k":
-            target_rate = 16000
+        # Legacy support for pcm8k (for HTTP endpoint)
+        elif output_format == "pcm8k":
+            target_rate = 8000
             if sample_rate != target_rate:
                 num_samples = int(len(audio_array) * target_rate / sample_rate)
                 audio_array = scipy.signal.resample(audio_array, num_samples)
@@ -123,8 +119,8 @@ def synthesize_speech(text: str, output_format: str = "wav", voice: str = None) 
         print(f"❌ TTS Error: {e}")
         traceback.print_exc()
         
-        # --- FALLBACK CHANGE ---
-        sample_rate = 8000 if output_format == "pcm8k" else (16000 if output_format == "pcm16k" else 24000)
+        # Fallback silence
+        sample_rate = 16000 if output_format == "pcm16k" else (8000 if output_format == "pcm8k" else 24000)
         duration = max(2.0, len(text.split()) * 0.5)
         samples = int(duration * sample_rate)
         audio_array = np.zeros(samples, dtype=np.float32)

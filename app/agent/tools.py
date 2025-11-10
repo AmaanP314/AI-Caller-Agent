@@ -5,13 +5,11 @@ from langchain_core.tools import tool
 
 @tool
 def update_patient_info(
-    customer_name: Annotated[Optional[str], "Patient's full name"] = None,
+    patient_name: Annotated[Optional[str], "Patient's full name"] = None,
     ethnicity: Annotated[Optional[str], "Patient's ethnic background"] = None,
     height: Annotated[Optional[str], "Patient's height"] = None,
     weight: Annotated[Optional[str], "Patient's weight"] = None,
-    immune_conditions: Annotated[Optional[List[str]], "List of immune-related conditions"] = None,
-    neuro_conditions: Annotated[Optional[List[str]], "List of neurological conditions"] = None,
-    cancer_history: Annotated[Optional[List[str]], "List of any cancer diagnoses"] = None,
+    medical_conditions: Annotated[Optional[List[str]], "List of any immune-related or neurological or cancer medical conditions"] = None,
     last_visit_date: Annotated[Optional[str], "When patient last visited their doctor"] = None,
     can_make_decisions: Annotated[Optional[bool], "Whether patient is capable of making own medical decisions"] = None,
     interested: Annotated[Optional[bool], "Whether patient is interested in moving forward"] = None,

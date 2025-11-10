@@ -2,18 +2,16 @@ import asyncio
 import json
 import base64
 import traceback
-import audioop # <-- IMPORT audioop FOR RESAMPLING
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends
 from app.streaming.manager import MedicareAgent
-from app.api.http import get_agent_manager # Reuse the dependency
+from app.api.http import get_agent_manager
 from app.audio.stt import transcribe_audio
 from app.audio import vad
 from app.streaming.pipeline import llm_producer, tts_consumer
 from app.config import VAD_SILENCE_TIMEOUT_MS
-from app.audio.utils import resample_pcm8k_to_pcm16k_scipy
+
 router = APIRouter()
 
-# --- Helper to clear queues on interruption ---
 async def clear_async_queue(q: asyncio.Queue):
     """Remove all items from an asyncio Queue."""
     while not q.empty():
@@ -23,31 +21,59 @@ async def clear_async_queue(q: asyncio.Queue):
         except asyncio.QueueEmpty:
             break
 
-# --- Task 1: The "Mouth" (Audio Sender) ---
+# --- FIXED: Audio sender now respects interruption ---
 async def audio_sender_task(
     websocket: WebSocket,
     audio_queue: asyncio.Queue,
+    interruption_event: asyncio.Event,
     session_id: str
 ):
     """
-    Pulls audio from the audio_queue and sends it over the WebSocket.
+    Pulls audio from queue and sends over WebSocket.
+    NOW CHECKS for interruption before sending each chunk.
     """
     try:
         while True:
-            audio_chunk = await audio_queue.get()
+            # Non-blocking check for interruption
+            if interruption_event.is_set():
+                # Drain any remaining audio from queue without sending
+                while not audio_queue.empty():
+                    try:
+                        audio_queue.get_nowait()
+                        audio_queue.task_done()
+                    except asyncio.QueueEmpty:
+                        break
+                
+                # Send interrupt signal to relay
+                await websocket.send_json({"type": "interrupt"})
+                print(f"[{session_id}] 🛑 Audio sender: Interrupt signal sent to relay")
+                
+                # Clear the interruption flag after handling
+                interruption_event.clear()
+                continue
+            
+            # Get audio chunk (with timeout to allow periodic interruption checks)
+            try:
+                audio_chunk = await asyncio.wait_for(audio_queue.get(), timeout=0.1)
+            except asyncio.TimeoutError:
+                continue  # Check interruption flag again
             
             if audio_chunk is None:
                 print(f"[{session_id}] Audio sender: TTS turn complete (ignoring sentinel).")
                 audio_queue.task_done()
                 continue
 
+            # Final check before sending
+            if interruption_event.is_set():
+                audio_queue.task_done()
+                continue
+
             chunk_b64 = base64.b64encode(audio_chunk).decode('utf-8')
-            
-            # --- CHANGE 1: Tell relay this is pcm8k ---
             await websocket.send_json({
                 "type": "audio_response",
                 "audio": chunk_b64,
-                "format": "pcm8k" 
+                "format": "pcm16k",  # Relay will downsample
+                "sample_rate": 16000
             })
             audio_queue.task_done()
             
@@ -62,7 +88,6 @@ async def audio_sender_task(
         print(f"[{session_id}] Audio sender task exiting.")
 
 
-# --- Task 2: The "Brain" (Agent Handler) ---
 async def agent_handler_task(
     session_id: str,
     transcript_queue: asyncio.Queue,
@@ -71,13 +96,13 @@ async def agent_handler_task(
     interruption_event: asyncio.Event
 ):
     """
-    Waits for transcripts, runs the LLM/TTS pipeline, and speaks.
+    Waits for transcripts, runs LLM/TTS pipeline.
     """
     try:
         while True:
             transcript = await transcript_queue.get()
             if transcript is None:
-                break 
+                break
 
             interruption_event.clear()
             agent_is_speaking_event.set()
@@ -88,9 +113,8 @@ async def agent_handler_task(
                 llm_producer(session_id, transcript, sentence_queue, interruption_event)
             )
             
-            # --- CHANGE 2: Request pcm8k instead of mulaw ---
             consumer_task = asyncio.create_task(
-                tts_consumer(sentence_queue, audio_queue, interruption_event, output_format="pcm8k")
+                tts_consumer(sentence_queue, audio_queue, interruption_event, output_format="pcm16k")
             )
 
             interruption_wait_task = asyncio.create_task(
@@ -103,12 +127,23 @@ async def agent_handler_task(
             )
             
             if interruption_wait_task in done:
-                print(f"[{session_id}] Agent handler: Interruption detected!")
+                print(f"[{session_id}] 🚨 INTERRUPTION DETECTED - Cancelling tasks")
+                
+                # Cancel both producer and consumer
                 producer_task.cancel()
                 consumer_task.cancel()
+                
+                # Clear queues
                 await clear_async_queue(sentence_queue)
                 await clear_async_queue(audio_queue)
-            
+                
+                # Wait for tasks to finish cancelling
+                try:
+                    await asyncio.gather(producer_task, consumer_task, return_exceptions=True)
+                except:
+                    pass
+                
+                print(f"[{session_id}] ✅ Tasks cancelled, queues cleared")
             else:
                 print(f"[{session_id}] Agent handler: LLM finished, waiting for TTS.")
                 interruption_wait_task.cancel()
@@ -135,8 +170,7 @@ async def audio_receiver_task(
     interruption_event: asyncio.Event
 ):
     """
-    Receives pcm8k, buffers it, resamples to pcm16k using Scipy,
-    runs VAD, and handles endpointing.
+    Receives pcm16k from relay, runs VAD, handles endpointing.
     """
     vad_model, vad_utils = vad.get_vad_model()
     if vad_model is None:
@@ -144,18 +178,13 @@ async def audio_receiver_task(
         return
 
     # VAD State
-    pcm16k_buffer = bytearray() # Buffer for VAD-sized chunks
-    speech_buffer_pcm = bytearray() # Buffer for full utterance
+    pcm16k_buffer = bytearray()
+    speech_buffer_pcm = bytearray()
     is_speaking = False
     silent_chunks = 0
     
-    # --- NEW: Buffer for 8k->16k resampling ---
-    pcm8k_resample_buffer = bytearray()
-    RESAMPLE_BATCH_MS = 100 # Resample in 100ms batches
-    RESAMPLE_BATCH_BYTES = int(8000 * 2 * (RESAMPLE_BATCH_MS / 1000)) # 8000*2*0.1 = 1600 bytes
-    
-    MS_PER_VAD_CHUNK = (vad.VAD_CHUNK_SAMPLES / vad.VAD_SAMPLE_RATE) * 1000 # 32ms
-    SILENT_CHUNKS_FOR_EOS = int(VAD_SILENCE_TIMEOUT_MS / MS_PER_VAD_CHUNK) # ~31
+    MS_PER_VAD_CHUNK = (vad.VAD_CHUNK_SAMPLES / vad.VAD_SAMPLE_RATE) * 1000
+    SILENT_CHUNKS_FOR_EOS = int(VAD_SILENCE_TIMEOUT_MS / MS_PER_VAD_CHUNK)
     
     try:
         while True:
@@ -170,40 +199,24 @@ async def audio_receiver_task(
             if msg['type'] != 'audio_data':
                 continue
             
-            if msg.get('format') != 'pcm8k':
+            if msg.get('format') != 'pcm16k':
                 print(f"[{session_id}] ⚠️ Received wrong format: {msg.get('format')}, skipping")
                 continue
                 
-            pcm8k_chunk = base64.b64decode(msg['audio'])
-            pcm8k_resample_buffer.extend(pcm8k_chunk)
+            # Receive 16k audio directly from relay (already upsampled)
+            pcm16k_chunk = base64.b64decode(msg['audio'])
+            pcm16k_buffer.extend(pcm16k_chunk)
 
-            # --- NEW: Resample in 100ms batches ---
-            while len(pcm8k_resample_buffer) >= RESAMPLE_BATCH_BYTES:
-                # 1. Get 100ms batch of pcm8k
-                pcm8k_batch = pcm8k_resample_buffer[:RESAMPLE_BATCH_BYTES]
-                pcm8k_resample_buffer = pcm8k_resample_buffer[RESAMPLE_BATCH_BYTES:]
-                
-                # 2. Resample 8k -> 16k using scipy
-                loop = asyncio.get_event_loop()
-                pcm16k_batch = await loop.run_in_executor(
-                    None, resample_pcm8k_to_pcm16k_scipy, pcm8k_batch
-                )
-                
-                if not pcm16k_batch:
-                    continue # Resampling failed
-                
-                # 3. Add resampled audio to VAD buffer
-                pcm16k_buffer.extend(pcm16k_batch)
-
-            # --- VAD Logic (unchanged) ---
+            # VAD processing
             while len(pcm16k_buffer) >= vad.VAD_CHUNK_BYTES:
                 current_chunk_pcm = pcm16k_buffer[:vad.VAD_CHUNK_BYTES]
                 pcm16k_buffer = pcm16k_buffer[vad.VAD_CHUNK_BYTES:]
                 
                 is_speech = vad.is_chunk_speech(current_chunk_pcm)
                 
+                # BARGE-IN DETECTION
                 if is_speech and agent_is_speaking_event.is_set() and not interruption_event.is_set():
-                    print(f"[{session_id}] 💥 BARGE-IN DETECTED!")
+                    print(f"[{session_id}] 💥 BARGE-IN DETECTED - Setting interruption!")
                     interruption_event.set()
                 
                 if is_speech:
@@ -237,7 +250,7 @@ async def audio_receiver_task(
                             })
                             await transcript_queue.put(transcript)
                         else:
-                             print(f"[{session_id}] 🔇 VAD triggered, but Whisper found no text.")
+                            print(f"[{session_id}] 🔇 VAD triggered, but Whisper found no text.")
                 
                 elif not is_speech and not is_speaking:
                     silent_chunks = 0
@@ -254,7 +267,7 @@ async def audio_receiver_task(
         print(f"[{session_id}] Receiver task exiting.")
         await transcript_queue.put(None)
 
-# --- The Main WebSocket Endpoint ---
+
 @router.websocket("/ws/vicidial/{session_id}")
 async def websocket_vicidial(
     websocket: WebSocket, 
@@ -265,12 +278,7 @@ async def websocket_vicidial(
     print(f"[{session_id}] 🔗 WebSocket connected with VAD/Interruption")
     
     caller_id = f"{websocket.client.host}:{websocket.client.port}"
-    # --- CHANGE 7: Pass caller_id to _get_buffer ---
-    # (Assuming _get_buffer is in your manager.py, add caller_id param)
-    # agent._get_buffer(session_id, caller_id=caller_id) 
-    # If not, this line can be:
     agent._get_buffer(session_id)["caller_id"] = caller_id
-
     
     transcript_queue = asyncio.Queue()
     audio_queue = asyncio.Queue()
@@ -279,8 +287,9 @@ async def websocket_vicidial(
     
     tasks = []
     try:
+        # FIXED: Pass interruption_event to audio sender
         sender_task = asyncio.create_task(
-            audio_sender_task(websocket, audio_queue, session_id)
+            audio_sender_task(websocket, audio_queue, interruption_event, session_id)
         )
         tasks.append(sender_task)
         
@@ -301,7 +310,7 @@ async def websocket_vicidial(
         tasks.append(receiver_task)
         
         print(f"[{session_id}] 🎤 Sending greeting...")
-        await transcript_queue.put("") 
+        await transcript_queue.put("")
         
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         
