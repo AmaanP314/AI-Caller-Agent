@@ -17,6 +17,7 @@ KOKORO_LANG = os.getenv("KOKORO_LANG", "a")
 
 # --- Database ---
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./medicare_agent.db")
+VAD_SPEECH_THRESHOLD = float(os.getenv("VAD_SPEECH_THRESHOLD", 0.7))
 
 # --- VAD Config (for later steps) ---
 VAD_SENSITIVITY = int(os.getenv("VAD_SENSITIVITY", 3)) # Example

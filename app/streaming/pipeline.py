@@ -36,7 +36,7 @@ async def agent_node_streaming(state: InterviewState) -> AsyncGenerator[dict, No
         api_key=GOOGLE_API_KEY
     ).bind_tools(tools)
     
-    sentence_buffer = SentenceBuffer(min_words=10)
+    sentence_buffer = SentenceBuffer(min_words=5)
     full_response_content = ""
     tool_calls = []
     

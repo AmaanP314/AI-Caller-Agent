@@ -1,6 +1,6 @@
 import torch
 import numpy as np
-
+from app.config import VAD_SPEECH_THRESHOLD
 # --- VAD Model Globals ---
 vad_model = None
 vad_utils = None
@@ -16,7 +16,7 @@ VAD_CHUNK_SAMPLES = 512 # <-- This was 1536, which was wrong.
 # 16-bit PCM = 2 bytes per sample
 VAD_CHUNK_BYTES = VAD_CHUNK_SAMPLES * 2 # 512 * 2 = 1024 bytes
 
-VAD_SPEECH_THRESHOLD = 0.5 # Confidence threshold
+VAD_THRESHOLD = VAD_SPEECH_THRESHOLD if VAD_SPEECH_THRESHOLD else 0.7
 
 def create_vad_model():
     """
@@ -101,7 +101,7 @@ def is_chunk_speech(pcm_chunk: bytes) -> bool:
         # 2. Get speech probability
         speech_prob = vad_model(audio_tensor, VAD_SAMPLE_RATE).item()
         
-        return speech_prob > VAD_SPEECH_THRESHOLD
+        return speech_prob > VAD_THRESHOLD
         
     except Exception as e:
         # Catch the specific error from the log just in case

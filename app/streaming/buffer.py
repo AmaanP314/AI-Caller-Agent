@@ -22,7 +22,7 @@ class SentenceBuffer:
         if token.strip():
             self.word_count += len(token.split())
 
-        sentence_terminators = ['.', '?', '!']
+        sentence_terminators = ['.', '?', '!', ',', ';']
 
         for terminator in sentence_terminators:
             if terminator in self.buffer:

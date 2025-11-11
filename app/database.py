@@ -22,15 +22,9 @@ class Conversation(Base):
     status = Column(String, default="running")
     
     # Patient Data
-    customer_name = Column(String, nullable=True)
-    ethnicity = Column(String, nullable=True)
-    height = Column(String, nullable=True)
-    weight = Column(String, nullable=True)
-    immune_conditions = Column(String, nullable=True) # Changed from JSON for simplicity
-    neuro_conditions = Column(String, nullable=True)
-    cancer_history = Column(String, nullable=True)
+    patient_name = Column(String, nullable=True)
+    medical_conditions = Column(String, nullable=True)
     last_visit_date = Column(String, nullable=True)
-    can_make_decisions = Column(Boolean, nullable=True)
     interested = Column(Boolean, nullable=True)
     
     # Conversation
