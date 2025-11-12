@@ -4,9 +4,9 @@ import traceback
 import numpy as np
 import soundfile as sf
 import scipy.signal
-from app.config import KOKORO_VOICE, KOKORO_LANG
+from app.config import KOKORO_VOICE, KOKORO_LANG, TTS_SPEED, AGENT_SAMPLE_RATE
 
-# This will be initialized in main.py
+# This will be initialized in main.py and passed
 tts_model = None
 
 def set_tts_model(model):
@@ -70,7 +70,8 @@ def _get_audio_array_from_tts_result(result):
 def synthesize_speech(text: str, output_format: str = "wav", voice: str = None) -> bytes:
     """
     Synchronous TTS synthesis.
-    FIXED: Generate pcm16k - let relay handle downsampling with stateful resampler.
+    Uses KOKORO_VOICE, TTS_SPEED, and AGENT_SAMPLE_RATE from config.
+    Generates pcm16k - let relay handle downsampling with stateful resampler.
     """
     if tts_model is None:
         raise Exception("TTS model not initialized")
@@ -79,12 +80,13 @@ def synthesize_speech(text: str, output_format: str = "wav", voice: str = None) 
         voice = KOKORO_VOICE
     
     try:
-        result = tts_model(text, voice=voice, speed=1.2)
+        # Use TTS_SPEED from config
+        result = tts_model(text, voice=voice, speed=TTS_SPEED)
         audio_array, sample_rate = _get_audio_array_from_tts_result(result)
         
-        # FIXED: Generate pcm16k instead of pcm8k
+        # Generate pcm16k for relay to downsample
         if output_format == "pcm16k":
-            target_rate = 16000
+            target_rate = AGENT_SAMPLE_RATE  # 16000 from config
             if sample_rate != target_rate:
                 # High-quality scipy resampling for ONE-TIME conversion
                 num_samples = int(len(audio_array) * target_rate / sample_rate)
@@ -96,10 +98,10 @@ def synthesize_speech(text: str, output_format: str = "wav", voice: str = None) 
             # Convert to 16-bit PCM
             pcm_data = (audio_array * 32767).astype(np.int16).tobytes()
             
-            print(f"[TTS] Generated pcm16k: {len(pcm_data)} bytes @ 16kHz")
+            print(f"[TTS] Generated pcm16k: {len(pcm_data)} bytes @ {AGENT_SAMPLE_RATE}Hz")
             return pcm_data
         
-        # Legacy support for pcm8k (for HTTP endpoint)
+        # Legacy support for pcm8k (for HTTP endpoint if needed)
         elif output_format == "pcm8k":
             target_rate = 8000
             if sample_rate != target_rate:
@@ -107,6 +109,7 @@ def synthesize_speech(text: str, output_format: str = "wav", voice: str = None) 
                 audio_array = scipy.signal.resample(audio_array, num_samples)
             
             pcm_data = (audio_array * 32767).astype(np.int16).tobytes()
+            print(f"[TTS] Generated pcm8k: {len(pcm_data)} bytes @ 8000Hz")
             return pcm_data
         
         else:  # Default to WAV
@@ -120,7 +123,7 @@ def synthesize_speech(text: str, output_format: str = "wav", voice: str = None) 
         traceback.print_exc()
         
         # Fallback silence
-        sample_rate = 16000 if output_format == "pcm16k" else (8000 if output_format == "pcm8k" else 24000)
+        sample_rate = AGENT_SAMPLE_RATE if output_format == "pcm16k" else (8000 if output_format == "pcm8k" else 24000)
         duration = max(2.0, len(text.split()) * 0.5)
         samples = int(duration * sample_rate)
         audio_array = np.zeros(samples, dtype=np.float32)

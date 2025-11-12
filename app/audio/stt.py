@@ -6,6 +6,7 @@ import scipy.signal
 import audioop
 from pydub import AudioSegment
 from fastapi import HTTPException
+from app.config import WHISPER_GENERATION_KWARGS
 
 # This will be initialized in main.py and passed
 whisper_pipeline = None
@@ -20,13 +21,14 @@ def transcribe_audio(audio_bytes: bytes, source_format: str = "pcm16k") -> str:
     Transcribe audio to text.
     Handles 'pcm16k' bytes directly for high accuracy.
     Handles 'mulaw' and 'wav' for the HTTP endpoint.
+    Uses WHISPER_GENERATION_KWARGS from config for quality settings.
     """
     if whisper_pipeline is None:
         raise HTTPException(status_code=500, detail="STT model not initialized")
         
     try:
         if source_format == "pcm16k":
-            # --- THIS IS THE ACCURACY FIX ---
+            # --- ACCURACY FIX ---
             # 1. Direct conversion from 16-bit PCM bytes to numpy array
             print(f"[STT] Transcribing {len(audio_bytes)} bytes of raw pcm16k")
             audio_array_int16 = np.frombuffer(audio_bytes, dtype=np.int16)
@@ -70,14 +72,36 @@ def transcribe_audio(audio_bytes: bytes, source_format: str = "pcm16k") -> str:
             num_samples = int(len(audio_array) * 16000 / sample_rate)
             audio_array = scipy.signal.resample(audio_array, num_samples)
         
-        # Run Whisper
-        result = whisper_pipeline(
-            audio_array,
-            return_timestamps=True,
-            generate_kwargs={"language": "english", "task": "transcribe"}
-        )
+        # Run Whisper with config-based generation kwargs
+        try:
+            result = whisper_pipeline(
+                audio_array,
+                return_timestamps=True,
+                generate_kwargs=WHISPER_GENERATION_KWARGS
+            )
+        except TypeError as e:
+            # Fallback if generation_kwargs has issues
+            print(f"[STT] Generation kwargs error: {e}")
+            print(f"[STT] Retrying with minimal kwargs...")
+            result = whisper_pipeline(
+                audio_array,
+                return_timestamps=True,
+                generate_kwargs={
+                    "language": "english",
+                    "task": "transcribe",
+                    "temperature": 0.0
+                }
+            )
         
-        return result["text"].strip()
+        transcript = result["text"].strip()
+        
+        # Log if we got empty result
+        if not transcript:
+            print(f"[STT] Warning: Whisper returned empty transcript")
+            print(f"     Audio duration: {len(audio_array)/16000:.2f}s")
+            print(f"     Audio energy: {np.sqrt(np.mean(audio_array**2)):.4f}")
+        
+        return transcript
         
     except Exception as e:
         print(f"Transcription error: {e}")
