@@ -1,28 +1,3 @@
-# import os
-# import dotenv
-
-# # Load environment variables from .env file
-# dotenv.load_dotenv()
-
-# # --- Google API ---
-# GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
-# if not GOOGLE_API_KEY:
-#     # In a real app, you might raise an error or just warn
-#     print("Warning: GOOGLE_API_KEY environment variable not set!")
-
-# # --- Model Config ---
-# WHISPER_MODEL = os.getenv("WHISPER_MODEL", "openai/whisper-large-v3-turbo")
-# KOKORO_VOICE = os.getenv("KOKORO_VOICE", "af_heart")
-# KOKORO_LANG = os.getenv("KOKORO_LANG", "a")
-
-# # --- Database ---
-# DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./medicare_agent.db")
-# VAD_SPEECH_THRESHOLD = float(os.getenv("VAD_SPEECH_THRESHOLD", 0.7))
-
-# # --- VAD Config (for later steps) ---
-# VAD_SENSITIVITY = int(os.getenv("VAD_SENSITIVITY", 3)) # Example
-# VAD_SILENCE_TIMEOUT_MS = int(os.getenv("VAD_SILENCE_TIMEOUT_MS", 1000))
-
 """
 Complete configuration file for Medicare AI Voice Agent
 All settings in one place for easy tuning
@@ -62,7 +37,7 @@ MIN_SPEECH_DURATION_MS = 300  # 300ms minimum
 
 # Energy threshold for audio quality validation
 # Audio below this RMS level is considered silence/noise
-MIN_AUDIO_ENERGY = 0.001  # 0.001 = very quiet threshold
+MIN_AUDIO_ENERGY = 0.005  # 0.001 = very quiet threshold
 
 # Pre-emphasis filter coefficient for noise reduction
 # Higher = more high-frequency boost (reduces low-freq noise)
@@ -96,7 +71,7 @@ AUDIO_LOG_DIR = Path("./audio_logs")
 
 # Debug print options
 DEBUG_PRINT_AUDIO_STATS = True   # Print energy/duration for each chunk
-DEBUG_PRINT_VAD_DECISIONS = False  # Print every VAD decision (very verbose!)
+DEBUG_PRINT_VAD_DECISIONS = True  # Print every VAD decision (very verbose!)
 
 # --- Asterisk/Telephony Configuration ---
 # These should match your Asterisk codec settings

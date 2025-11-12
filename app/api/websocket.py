@@ -104,6 +104,7 @@ async def audio_sender_task(
                 # 3. Reset flags AFTER clearing
                 interruption_event.clear()
                 agent_is_speaking_event.clear()
+                print(f"[{session_id}] 🔇 Agent interrupted and stopped (flag cleared)")
                 
                 # 4. Small delay to ensure relay processes interrupt
                 await asyncio.sleep(0.05)
@@ -121,7 +122,10 @@ async def audio_sender_task(
             if audio_chunk is None:
                 print(f"[{session_id}] Audio sender: Turn complete sentinel")
                 audio_queue.task_done()
+                # CRITICAL: Clear speaking flag HERE, not in agent_handler
+                # This ensures flag stays set while audio is in queue
                 agent_is_speaking_event.clear()
+                print(f"[{session_id}] 🔇 Agent finished speaking (flag cleared)")
                 continue
 
             # Double-check interruption before sending
@@ -140,6 +144,10 @@ async def audio_sender_task(
                 "sample_rate": AGENT_SAMPLE_RATE
             })
             audio_queue.task_done()
+            
+            # CRITICAL: Small delay to allow receiver to process incoming audio
+            # This ensures barge-in detection has a chance to run
+            await asyncio.sleep(0.005)  # 5ms
             
     except WebSocketDisconnect:
         print(f"[{session_id}] Audio sender disconnected.")
@@ -179,6 +187,10 @@ async def agent_handler_task(
             consumer_task = asyncio.create_task(
                 tts_consumer(sentence_queue, audio_queue, interruption_event, output_format="pcm16k")
             )
+            
+            # IMPORTANT: Set speaking flag AFTER tasks are created
+            # This ensures the flag is set before audio starts flowing
+            print(f"[{session_id}] 🔊 Agent is now speaking (flag set)")
 
             interruption_wait_task = asyncio.create_task(
                 interruption_event.wait()
@@ -209,7 +221,8 @@ async def agent_handler_task(
                 interruption_wait_task.cancel()
                 await consumer_task
 
-            agent_is_speaking_event.clear()
+            # DON'T clear agent_is_speaking_event here!
+            # It will be cleared by audio_sender_task when it sends the last chunk
             transcript_queue.task_done()
             
     except asyncio.CancelledError:
@@ -279,7 +292,8 @@ async def audio_receiver_task(
         print(f"   Min speech duration: {MIN_SPEECH_DURATION_MS}ms ({MIN_SPEECH_CHUNKS} chunks)")
         print(f"   Barge-in threshold: {MIN_BARGEIN_SPEECH_CHUNKS} chunks")
         print(f"   VAD threshold: {VAD_SPEECH_THRESHOLD}")
-        print(f"   Energy threshold: {MIN_AUDIO_ENERGY}")
+        print(f"   Energy threshold: {MIN_AUDIO_ENERGY:.4f} (effective: {MIN_AUDIO_ENERGY * 1.5:.4f})")
+        print(f"   Agent speaking flag: {agent_is_speaking_event.is_set()}")
     
     try:
         while True:
@@ -312,10 +326,10 @@ async def audio_receiver_task(
                 # Quality check: Ensure chunk has sufficient energy
                 energy = calculate_rms_energy(current_chunk)
                 
-                if energy < MIN_AUDIO_ENERGY:
-                    # Too quiet - likely silence or noise
+                # STRICTER: Increase threshold slightly to reduce false positives
+                if energy < MIN_AUDIO_ENERGY * 1.5:  # 1.5x threshold for better filtering
                     if DEBUG_PRINT_VAD_DECISIONS:
-                        print(f"[{session_id}] 🔇 Low energy: {energy:.4f}")
+                        print(f"[{session_id}] 🔇 Low energy: {energy:.4f} < {MIN_AUDIO_ENERGY * 1.5:.4f}")
                     
                     if is_speaking:
                         silent_chunks += 1
@@ -343,12 +357,22 @@ async def audio_receiver_task(
                     if agent_is_speaking_event.is_set():
                         consecutive_speech_during_agent += 1
                         
+                        if DEBUG_PRINT_VAD_DECISIONS:
+                            print(f"[{session_id}] 🔊 Speech during agent playback: {consecutive_speech_during_agent} chunks (energy={energy:.4f})")
+                        
                         # BARGE-IN: Need multiple consecutive speech chunks
                         if consecutive_speech_during_agent >= MIN_BARGEIN_SPEECH_CHUNKS:
                             if not interruption_event.is_set():
-                                print(f"[{session_id}] 💥 BARGE-IN ({consecutive_speech_during_agent} chunks, {consecutive_speech_during_agent * MS_PER_VAD_CHUNK:.0f}ms)")
+                                duration_ms = consecutive_speech_during_agent * MS_PER_VAD_CHUNK
+                                print(f"[{session_id}] 💥 BARGE-IN DETECTED! ({consecutive_speech_during_agent} chunks, {duration_ms:.0f}ms, energy={energy:.4f})")
                                 interruption_event.set()
+                                
+                                # Log for debugging
+                                print(f"[{session_id}] 🚨 Interruption event SET - agent should stop now")
                     else:
+                        # Agent not speaking - reset counter
+                        if consecutive_speech_during_agent > 0 and DEBUG_PRINT_VAD_DECISIONS:
+                            print(f"[{session_id}] ⚠️  Speech detected but agent_is_speaking=False (counter reset)")
                         consecutive_speech_during_agent = 0
                     
                     if not is_speaking:
